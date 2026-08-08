@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Lamborghini EA"
 #property link      "https://github.com/ngannguyen19390506-droid/lamborgini"
-#property version   "1.00"
+#property version   "1.01"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -46,6 +46,13 @@ enum LotMode
    LOT_FIXED = 0,
    LOT_RISK_PERCENT,
    LOT_SMART
+};
+
+enum EntryExecution
+{
+   EXEC_MARKET = 0,
+   EXEC_LIMIT,
+   EXEC_STOP
 };
 
 struct RegimeInfo
@@ -92,10 +99,12 @@ struct TradeSignal
    string strategy;
    int score;
    double idealEntry;
+   double orderPrice;
    double sl;
    double tp;
    double invalidation;
    double rr;
+   EntryExecution execution;
    string reason;
 };
 
@@ -153,6 +162,14 @@ input bool            InpUseRoomToTargetFilter    = true;
 input bool            InpSkipIfRoomTooSmall       = false;
 input double          InpMaxEntryAtrDeviation     = 0.35;
 input int             InpMaxSlippagePoints        = 40;
+input bool            InpUsePendingOrders         = true;
+input int             InpMaxPendingOrders         = 2;
+input int             InpPendingExpiryBars        = 3;
+input double          InpMinPendingDistancePoints = 30.0;
+input double          InpLimitEntryAtrOffset      = 0.10;
+input double          InpStopEntryAtrOffset       = 0.12;
+input double          InpMaxPendingAtrDistance    = 2.50;
+input bool            InpCancelInvalidPending     = true;
 
 input group "Lot Management"
 input LotMode         InpLotMode                   = LOT_SMART;
@@ -311,6 +328,7 @@ void OnTick()
 
    RegimeInfo regime = DetectRegime();
    ManageBaskets(regime, buyBasket, sellBasket);
+   ManagePendingOrders(regime);
 
    TradingState state = EffectiveTradingState(buyBasket, sellBasket);
    if(state == STATE_EMERGENCY && InpEmergencyCloseAll)
@@ -436,12 +454,22 @@ TradeSignal DetectTrendPullback(const Direction dir, const RegimeInfo &regime)
    s.reason = StringFormat("regime=%s; zone=ema; distAtr=%.2f; pa=%s",
                            regime.label, distanceAtr, pa.tags);
 
+   double desiredEntry = CurrentEntryPrice(dir);
+   EntryExecution execution = EXEC_MARKET;
+   double limitEntry = PullbackLimitPrice(dir, emaFast, atr);
+   if(InpUsePendingOrders && IsValidLimitPrice(dir, limitEntry))
+   {
+      desiredEntry = limitEntry;
+      execution = EXEC_LIMIT;
+   }
+
    double invalidation = (dir == DIR_BUY)
                          ? MathMin(LowestLow(InpTriggerTf, 1, 5), emaSlow)
                          : MathMax(HighestHigh(InpTriggerTf, 1, 5), emaSlow);
-   if(!CompleteSignalPrices(s, invalidation))
+   if(!CompleteSignalPrices(s, invalidation, desiredEntry))
       return EmptySignal();
 
+   s.execution = execution;
    s.valid = true;
    return s;
 }
@@ -476,9 +504,10 @@ TradeSignal DetectLiquiditySweep(const Direction dir, const RegimeInfo &regime)
    double invalidation = (dir == DIR_BUY)
                          ? iLow(TradeSymbol, InpTriggerTf, 1)
                          : iHigh(TradeSymbol, InpTriggerTf, 1);
-   if(!CompleteSignalPrices(s, invalidation))
+   if(!CompleteSignalPrices(s, invalidation, CurrentEntryPrice(dir)))
       return EmptySignal();
 
+   s.execution = EXEC_MARKET;
    s.valid = true;
    return s;
 }
@@ -509,10 +538,20 @@ TradeSignal DetectFvgRetracement(const Direction dir, const RegimeInfo &regime)
    s.reason = StringFormat("regime=%s; fvg=%.2f-%.2f; pa=%s",
                            regime.label, zoneLow, zoneHigh, pa.tags);
 
+   double desiredEntry = CurrentEntryPrice(dir);
+   EntryExecution execution = EXEC_MARKET;
+   double limitEntry = NormalizePrice((zoneLow + zoneHigh) * 0.5);
+   if(InpUsePendingOrders && IsValidLimitPrice(dir, limitEntry))
+   {
+      desiredEntry = limitEntry;
+      execution = EXEC_LIMIT;
+   }
+
    double invalidation = (dir == DIR_BUY) ? zoneLow : zoneHigh;
-   if(!CompleteSignalPrices(s, invalidation))
+   if(!CompleteSignalPrices(s, invalidation, desiredEntry))
       return EmptySignal();
 
+   s.execution = execution;
    s.valid = true;
    return s;
 }
@@ -565,10 +604,20 @@ TradeSignal DetectBreakoutRetest(const Direction dir, const RegimeInfo &regime)
    s.score = BuildScore(dir, regime, setupScore, locationScore, pa, "BreakoutRetest");
    s.reason = StringFormat("regime=%s; boundary=%.2f; pa=%s", regime.label, boundary, pa.tags);
 
+   double desiredEntry = CurrentEntryPrice(dir);
+   EntryExecution execution = EXEC_MARKET;
+   double stopEntry = BreakoutStopPrice(dir, atr);
+   if(InpUsePendingOrders && IsValidStopPrice(dir, stopEntry))
+   {
+      desiredEntry = stopEntry;
+      execution = EXEC_STOP;
+   }
+
    double invalidation = (dir == DIR_BUY) ? boundary - atr * 0.25 : boundary + atr * 0.25;
-   if(!CompleteSignalPrices(s, invalidation))
+   if(!CompleteSignalPrices(s, invalidation, desiredEntry))
       return EmptySignal();
 
+   s.execution = execution;
    s.valid = true;
    return s;
 }
@@ -639,13 +688,12 @@ void TryOpenSignal(const TradeSignal &signal, const TradingState state)
    if(!ExposureGuard(signal, lot, sameBasket))
       return;
 
-   string comment = StringFormat("Lambo|%s|%d", ShortStrategyName(signal.strategy), signal.score);
-   bool ok = false;
+   string comment = StringFormat("Lambo|%s|%s|%d",
+                                 ShortStrategyName(signal.strategy),
+                                 ExecutionName(signal.execution),
+                                 signal.score);
    ResetLastError();
-   if(signal.direction == DIR_BUY)
-      ok = Trade.Buy(lot, TradeSymbol, 0.0, signal.sl, signal.tp, comment);
-   else if(signal.direction == DIR_SELL)
-      ok = Trade.Sell(lot, TradeSymbol, 0.0, signal.sl, signal.tp, comment);
+   bool ok = SubmitSignalOrder(signal, lot, comment);
 
    double retcode = (double)Trade.ResultRetcode();
    string resultText = Trade.ResultRetcodeDescription();
@@ -660,14 +708,71 @@ void TryOpenSignal(const TradeSignal &signal, const TradingState state)
       WriteJournal((isRecovery ? "ENTRY_RECOVERY" : (isPyramid ? "ENTRY_PYRAMID" : "ENTRY")),
                    DirectionName(signal.direction), signal.strategy, RegimeName(DetectRegime().regime),
                    signal.score, signal.idealEntry, signal.sl, signal.tp, lot,
-                   signal.rr, SpreadPoints(), 0.0, signal.reason);
+                   signal.rr, SpreadPoints(), 0.0, signal.reason,
+                   ExecutionName(signal.execution), signal.orderPrice);
    }
    else
    {
       WriteJournal("ORDER_FAILED", DirectionName(signal.direction), signal.strategy,
                    resultText, signal.score, signal.idealEntry, signal.sl, signal.tp,
-                   lot, signal.rr, SpreadPoints(), retcode, signal.reason);
+                   lot, signal.rr, SpreadPoints(), retcode, signal.reason,
+                   ExecutionName(signal.execution), signal.orderPrice);
    }
+}
+
+bool SubmitSignalOrder(const TradeSignal &signal,
+                       const double lot,
+                       const string comment)
+{
+   if(signal.execution == EXEC_LIMIT)
+   {
+      ENUM_ORDER_TYPE_TIME timeType = ORDER_TIME_GTC;
+      datetime expiration = 0;
+      if(InpPendingExpiryBars > 0)
+      {
+         timeType = ORDER_TIME_SPECIFIED;
+         expiration = PendingExpiryTime();
+      }
+
+      if(signal.direction == DIR_BUY)
+         return Trade.BuyLimit(lot, signal.orderPrice, TradeSymbol,
+                               signal.sl, signal.tp, timeType, expiration, comment);
+      if(signal.direction == DIR_SELL)
+         return Trade.SellLimit(lot, signal.orderPrice, TradeSymbol,
+                                signal.sl, signal.tp, timeType, expiration, comment);
+   }
+   else if(signal.execution == EXEC_STOP)
+   {
+      ENUM_ORDER_TYPE_TIME timeType = ORDER_TIME_GTC;
+      datetime expiration = 0;
+      if(InpPendingExpiryBars > 0)
+      {
+         timeType = ORDER_TIME_SPECIFIED;
+         expiration = PendingExpiryTime();
+      }
+
+      if(signal.direction == DIR_BUY)
+         return Trade.BuyStop(lot, signal.orderPrice, TradeSymbol,
+                              signal.sl, signal.tp, timeType, expiration, comment);
+      if(signal.direction == DIR_SELL)
+         return Trade.SellStop(lot, signal.orderPrice, TradeSymbol,
+                               signal.sl, signal.tp, timeType, expiration, comment);
+   }
+
+   if(signal.direction == DIR_BUY)
+      return Trade.Buy(lot, TradeSymbol, 0.0, signal.sl, signal.tp, comment);
+   if(signal.direction == DIR_SELL)
+      return Trade.Sell(lot, TradeSymbol, 0.0, signal.sl, signal.tp, comment);
+
+   return false;
+}
+
+datetime PendingExpiryTime()
+{
+   int seconds = PeriodSeconds(InpTriggerTf);
+   if(seconds <= 0)
+      seconds = 120;
+   return TimeCurrent() + seconds * MathMax(1, InpPendingExpiryBars);
 }
 
 bool ExecutionGuard(const TradeSignal &signal, const BasketInfo &sameBasket)
@@ -693,18 +798,50 @@ bool ExecutionGuard(const TradeSignal &signal, const BasketInfo &sameBasket)
 
    double atr = BufferValue(hAtrTrigger, 0, 1);
    double price = CurrentEntryPrice(signal.direction);
-   if(atr > 0.0 && MathAbs(price - signal.idealEntry) > atr * InpMaxEntryAtrDeviation)
+   if(signal.execution == EXEC_MARKET && atr > 0.0 &&
+      MathAbs(price - signal.idealEntry) > atr * InpMaxEntryAtrDeviation)
    {
       WriteJournal("REJECT_CHASE", DirectionName(signal.direction), signal.strategy, "",
                    signal.score, signal.idealEntry, signal.sl, signal.tp,
                    0.0, signal.rr, SpreadPoints(), 0.0,
-                   StringFormat("price=%.2f; %s", price, signal.reason));
+                   StringFormat("price=%.2f; %s", price, signal.reason),
+                   ExecutionName(signal.execution), signal.orderPrice);
       return false;
+   }
+
+   if(signal.execution != EXEC_MARKET)
+   {
+      if(CountOwnedPendingOrders(DIR_NONE) >= InpMaxPendingOrders)
+      {
+         WriteJournal("REJECT_PENDING_LIMIT", DirectionName(signal.direction), signal.strategy, "",
+                      signal.score, signal.idealEntry, signal.sl, signal.tp,
+                      0.0, signal.rr, SpreadPoints(), 0.0, signal.reason,
+                      ExecutionName(signal.execution), signal.orderPrice);
+         return false;
+      }
+
+      if(!PendingPriceGuard(signal))
+      {
+         WriteJournal("REJECT_PENDING_PRICE", DirectionName(signal.direction), signal.strategy, "",
+                      signal.score, signal.idealEntry, signal.sl, signal.tp,
+                      0.0, signal.rr, SpreadPoints(), 0.0, signal.reason,
+                      ExecutionName(signal.execution), signal.orderPrice);
+         return false;
+      }
+
+      if(HasNearPendingOrder(signal))
+      {
+         WriteJournal("REJECT_DUP_PENDING", DirectionName(signal.direction), signal.strategy, "",
+                      signal.score, signal.idealEntry, signal.sl, signal.tp,
+                      0.0, signal.rr, SpreadPoints(), 0.0, signal.reason,
+                      ExecutionName(signal.execution), signal.orderPrice);
+         return false;
+      }
    }
 
    if(sameBasket.count > 0)
    {
-      double spacing = MathAbs(price - sameBasket.lastEntryPrice);
+      double spacing = MathAbs(SignalEntryPrice(signal) - sameBasket.lastEntryPrice);
       double minSpacing = BufferValue(hAtrSetup, 0, 1) * InpMinReentrySpacingAtr;
       if(minSpacing > 0.0 && spacing < minSpacing)
       {
@@ -733,7 +870,7 @@ double CalculateLot(const TradeSignal &signal,
    double lot = InpFixedLot;
    if(InpLotMode != LOT_FIXED)
    {
-      double entry = CurrentEntryPrice(signal.direction);
+      double entry = SignalEntryPrice(signal);
       double stopDistance = MathAbs(entry - signal.sl);
       double riskPerLot = MoneyRiskPerLot(stopDistance);
       if(riskPerLot <= 0.0)
@@ -782,11 +919,11 @@ bool ExposureGuard(const TradeSignal &signal, const double newLot, const BasketI
    BasketInfo sellBasket;
    BuildBasket(DIR_BUY, buyBasket);
    BuildBasket(DIR_SELL, sellBasket);
-   double totalLots = buyBasket.lots + sellBasket.lots;
+   double totalLots = buyBasket.lots + sellBasket.lots + PendingOrderLots(DIR_NONE);
    if(totalLots + newLot > InpMaxTotalLot)
       return false;
 
-   if(sameBasket.lots + newLot > InpMaxBasketLot)
+   if(sameBasket.lots + PendingOrderLots(signal.direction) + newLot > InpMaxBasketLot)
       return false;
 
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -794,7 +931,7 @@ bool ExposureGuard(const TradeSignal &signal, const double newLot, const BasketI
    {
       // Approximate added hard risk from the new order. Existing floating loss is
       // included so recovery cannot keep increasing exposure after a bad thesis.
-      double stopDistance = MathAbs(CurrentEntryPrice(signal.direction) - signal.sl);
+      double stopDistance = MathAbs(SignalEntryPrice(signal) - signal.sl);
       double riskMoney = MoneyRiskPerLot(stopDistance) * newLot + MathMax(0.0, -sameBasket.floating);
       double riskPct = riskMoney / equity * 100.0;
       if(riskPct > InpMaxBasketRiskPct)
@@ -893,6 +1030,49 @@ void ManageBaskets(const RegimeInfo &regime,
 
       if(net >= InpCrossBasketNetTargetMoney && enoughOffset)
          CloseAllOwnedPositions("CROSS_BASKET_NET_EXIT");
+   }
+}
+
+void ManagePendingOrders(const RegimeInfo &regime)
+{
+   if(!InpCancelInvalidPending)
+      return;
+
+   double atr = BufferValue(hAtrSetup, 0, 1);
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(OrderGetString(ORDER_SYMBOL) != TradeSymbol)
+         continue;
+      if(OrderGetInteger(ORDER_MAGIC) != (long)InpMagicNumber)
+         continue;
+
+      ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(!IsPendingOrderType(type))
+         continue;
+
+      Direction dir = PendingOrderDirection(type);
+      double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+      double volume = OrderGetDouble(ORDER_VOLUME_CURRENT);
+      double current = CurrentEntryPrice(dir);
+      bool invalidRegime = IsStrongOpposite(dir, regime.regime);
+      bool tooFar = atr > 0.0 &&
+                    MathAbs(orderPrice - current) > atr * InpMaxPendingAtrDistance;
+
+      if(invalidRegime || tooFar)
+      {
+         string reason = invalidRegime ? "pending_regime_invalid" : "pending_too_far";
+         ResetLastError();
+         bool deleted = Trade.OrderDelete(ticket);
+         WriteJournal(deleted ? "CANCEL_PENDING" : "CANCEL_PENDING_FAILED",
+                      DirectionName(dir), "", regime.label, 0,
+                      current, 0.0, 0.0, volume, 0.0, SpreadPoints(),
+                      (double)Trade.ResultRetcode(), reason,
+                      PendingTypeName(type), orderPrice);
+      }
    }
 }
 
@@ -1357,14 +1537,101 @@ bool IsPriceStretched(const Direction dir)
    return MathAbs(price - ema) / atr >= 1.0;
 }
 
-bool CompleteSignalPrices(TradeSignal &signal, const double invalidation)
+double PullbackLimitPrice(const Direction dir,
+                          const double emaFast,
+                          const double atr)
 {
-   double entry = CurrentEntryPrice(signal.direction);
+   double offset = MathMax(0.0, atr * InpLimitEntryAtrOffset);
+   if(dir == DIR_BUY)
+      return NormalizePrice(emaFast - offset);
+   if(dir == DIR_SELL)
+      return NormalizePrice(emaFast + offset);
+   return 0.0;
+}
+
+double BreakoutStopPrice(const Direction dir, const double atr)
+{
+   double offset = MathMax(PointValue(), atr * InpStopEntryAtrOffset);
+   if(dir == DIR_BUY)
+      return NormalizePrice(iHigh(TradeSymbol, InpTriggerTf, 1) + offset);
+   if(dir == DIR_SELL)
+      return NormalizePrice(iLow(TradeSymbol, InpTriggerTf, 1) - offset);
+   return 0.0;
+}
+
+bool IsValidLimitPrice(const Direction dir, const double price)
+{
+   MqlTick tick;
+   if(price <= 0.0 || !SymbolInfoTick(TradeSymbol, tick))
+      return false;
+
+   double minDistance = MinPendingDistance();
+   if(dir == DIR_BUY)
+      return price < tick.ask - minDistance;
+   if(dir == DIR_SELL)
+      return price > tick.bid + minDistance;
+   return false;
+}
+
+bool IsValidStopPrice(const Direction dir, const double price)
+{
+   MqlTick tick;
+   if(price <= 0.0 || !SymbolInfoTick(TradeSymbol, tick))
+      return false;
+
+   double minDistance = MinPendingDistance();
+   if(dir == DIR_BUY)
+      return price > tick.ask + minDistance;
+   if(dir == DIR_SELL)
+      return price < tick.bid - minDistance;
+   return false;
+}
+
+bool PendingPriceGuard(const TradeSignal &signal)
+{
+   if(signal.execution == EXEC_LIMIT && !IsValidLimitPrice(signal.direction, signal.orderPrice))
+      return false;
+   if(signal.execution == EXEC_STOP && !IsValidStopPrice(signal.direction, signal.orderPrice))
+      return false;
+
+   double atr = BufferValue(hAtrSetup, 0, 1);
+   double current = CurrentEntryPrice(signal.direction);
+   if(atr > 0.0 && MathAbs(signal.orderPrice - current) > atr * InpMaxPendingAtrDistance)
+      return false;
+
+   return true;
+}
+
+double MinPendingDistance()
+{
+   double point = PointValue();
+   int stopLevel = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_TRADE_STOPS_LEVEL);
+   return MathMax(InpMinPendingDistancePoints * point, stopLevel * point);
+}
+
+double SignalEntryPrice(const TradeSignal &signal)
+{
+   if(signal.execution == EXEC_MARKET)
+      return CurrentEntryPrice(signal.direction);
+   return signal.orderPrice;
+}
+
+double NormalizePrice(const double price)
+{
+   return NormalizeDouble(price, DigitsForSymbol());
+}
+
+bool CompleteSignalPrices(TradeSignal &signal,
+                          const double invalidation,
+                          const double entryPrice)
+{
+   double entry = entryPrice;
    double atr = BufferValue(hAtrTrigger, 0, 1);
    if(entry <= 0.0 || atr <= 0.0)
       return false;
 
    signal.idealEntry = entry;
+   signal.orderPrice = entry;
    signal.invalidation = invalidation;
 
    double point = PointValue();
@@ -1751,6 +2018,107 @@ int ConsecutiveLosses()
    return losses;
 }
 
+int CountOwnedPendingOrders(const Direction dir)
+{
+   int count = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(OrderGetString(ORDER_SYMBOL) != TradeSymbol)
+         continue;
+      if(OrderGetInteger(ORDER_MAGIC) != (long)InpMagicNumber)
+         continue;
+
+      ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(!IsPendingOrderType(type))
+         continue;
+
+      if(dir == DIR_NONE || PendingOrderDirection(type) == dir)
+         count++;
+   }
+   return count;
+}
+
+double PendingOrderLots(const Direction dir)
+{
+   double lots = 0.0;
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(OrderGetString(ORDER_SYMBOL) != TradeSymbol)
+         continue;
+      if(OrderGetInteger(ORDER_MAGIC) != (long)InpMagicNumber)
+         continue;
+
+      ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(!IsPendingOrderType(type))
+         continue;
+
+      if(dir == DIR_NONE || PendingOrderDirection(type) == dir)
+         lots += OrderGetDouble(ORDER_VOLUME_CURRENT);
+   }
+   return lots;
+}
+
+bool HasNearPendingOrder(const TradeSignal &signal)
+{
+   double atr = BufferValue(hAtrSetup, 0, 1);
+   double duplicateDistance = MathMax(MinPendingDistance(), atr * 0.25);
+
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(OrderGetString(ORDER_SYMBOL) != TradeSymbol)
+         continue;
+      if(OrderGetInteger(ORDER_MAGIC) != (long)InpMagicNumber)
+         continue;
+
+      ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(!IsPendingOrderType(type))
+         continue;
+      if(PendingOrderDirection(type) != signal.direction)
+         continue;
+
+      double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+      if(MathAbs(orderPrice - signal.orderPrice) <= duplicateDistance)
+         return true;
+   }
+
+   return false;
+}
+
+bool IsPendingOrderType(const ENUM_ORDER_TYPE type)
+{
+   return type == ORDER_TYPE_BUY_LIMIT ||
+          type == ORDER_TYPE_SELL_LIMIT ||
+          type == ORDER_TYPE_BUY_STOP ||
+          type == ORDER_TYPE_SELL_STOP ||
+          type == ORDER_TYPE_BUY_STOP_LIMIT ||
+          type == ORDER_TYPE_SELL_STOP_LIMIT;
+}
+
+Direction PendingOrderDirection(const ENUM_ORDER_TYPE type)
+{
+   if(type == ORDER_TYPE_BUY_LIMIT ||
+      type == ORDER_TYPE_BUY_STOP ||
+      type == ORDER_TYPE_BUY_STOP_LIMIT)
+      return DIR_BUY;
+   if(type == ORDER_TYPE_SELL_LIMIT ||
+      type == ORDER_TYPE_SELL_STOP ||
+      type == ORDER_TYPE_SELL_STOP_LIMIT)
+      return DIR_SELL;
+   return DIR_NONE;
+}
+
 //+------------------------------------------------------------------+
 //| Session and string helpers                                        |
 //+------------------------------------------------------------------+
@@ -1813,10 +2181,12 @@ TradeSignal EmptySignal()
    s.strategy = "";
    s.score = 0;
    s.idealEntry = 0.0;
+   s.orderPrice = 0.0;
    s.sl = 0.0;
    s.tp = 0.0;
    s.invalidation = 0.0;
    s.rr = 0.0;
+   s.execution = EXEC_MARKET;
    s.reason = "";
    return s;
 }
@@ -1872,6 +2242,31 @@ string StateName(const TradingState state)
    }
 }
 
+string ExecutionName(const EntryExecution execution)
+{
+   switch(execution)
+   {
+      case EXEC_LIMIT:  return "LIMIT";
+      case EXEC_STOP:   return "STOP";
+      case EXEC_MARKET:
+      default:          return "MARKET";
+   }
+}
+
+string PendingTypeName(const ENUM_ORDER_TYPE type)
+{
+   switch(type)
+   {
+      case ORDER_TYPE_BUY_LIMIT:       return "BUY_LIMIT";
+      case ORDER_TYPE_SELL_LIMIT:      return "SELL_LIMIT";
+      case ORDER_TYPE_BUY_STOP:        return "BUY_STOP";
+      case ORDER_TYPE_SELL_STOP:       return "SELL_STOP";
+      case ORDER_TYPE_BUY_STOP_LIMIT:  return "BUY_STOP_LIMIT";
+      case ORDER_TYPE_SELL_STOP_LIMIT: return "SELL_STOP_LIMIT";
+      default:                         return "ORDER";
+   }
+}
+
 string ShortStrategyName(const string strategy)
 {
    if(strategy == "TrendPullback") return "TPB";
@@ -1905,7 +2300,7 @@ void InitJournal()
    if(FileSize(handle) == 0)
    {
       FileWrite(handle, "timestamp", "action", "symbol", "direction", "strategy",
-                "context", "score", "entry", "sl", "tp", "lot", "rr",
+                "execution", "order_price", "context", "score", "entry", "sl", "tp", "lot", "rr",
                 "spread_points", "pnl_or_code", "equity", "drawdown_pct", "reason");
    }
    FileClose(handle);
@@ -1923,7 +2318,9 @@ void WriteJournal(const string action,
                   const double rr,
                   const double spread,
                   const double pnlOrCode,
-                  const string reason)
+                  const string reason,
+                  const string execution = "",
+                  const double orderPrice = 0.0)
 {
    if(!InpWriteJournal)
       return;
@@ -1940,6 +2337,8 @@ void WriteJournal(const string action,
              TradeSymbol,
              direction,
              strategy,
+             execution,
+             DoubleToString(orderPrice, DigitsForSymbol()),
              context,
              score,
              DoubleToString(entry, DigitsForSymbol()),

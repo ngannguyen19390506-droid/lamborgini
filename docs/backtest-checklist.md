@@ -11,6 +11,10 @@ Theo dõi trong journal:
 - `REJECT_CHASE`
 - `REJECT_SPACING`
 - `REJECT_STATE`
+- `REJECT_PENDING_LIMIT`
+- `REJECT_PENDING_PRICE`
+- `REJECT_DUP_PENDING`
+- `CANCEL_PENDING`
 - `ENTRY`
 - `ENTRY_RECOVERY`
 - `ENTRY_PYRAMID`
@@ -21,6 +25,7 @@ Nếu 1-2 tháng không có lệnh, thử:
 - đặt `InpSkipIfRoomTooSmall = false`
 - tăng nhẹ `InpMaxEntryAtrDeviation`
 - tăng `InpMaxSpreadPoints` theo spread thực tế của broker
+- nếu pending quá ít khớp, giảm `InpMinPendingDistancePoints` hoặc tăng `InpPendingExpiryBars`
 
 ## 2. Test logic trước khi test lot
 
@@ -42,6 +47,8 @@ Optimize theo cụm nhỏ, tránh overfit:
 - EMA distance: 0.9-1.8 ATR
 - minimum RR: 1.2-2.2
 - ATR SL buffer: 0.2-0.7
+- pending expiry bars: 1-6
+- pending min distance theo spread/stop-level broker
 - basket trailing start/giveback
 
 Không optimize quá nhiều tham số cùng lúc.

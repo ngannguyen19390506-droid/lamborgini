@@ -45,6 +45,22 @@ Mỗi candidate được chấm 0-100 theo:
 
 Hard filter chủ yếu nằm ở risk/safety: spread, drawdown, max lot, max basket risk, max trades/hour, margin usage, consecutive losses, price deviation và duplicate/chasing guard.
 
+## Entry execution
+
+EA hiện hỗ trợ 3 kiểu vào lệnh:
+
+- `MARKET`: dùng cho Liquidity Sweep sau reclaim và các setup đã xác nhận mà giá còn hợp lệ.
+- `LIMIT`: dùng cho Trend Pullback và FVG khi có giá pullback/retest tốt hơn giá hiện tại.
+- `STOP`: dùng cho Breakout Retest khi cần đợi giá phá tiếp sau retest.
+
+Các lệnh chờ có guard riêng:
+
+- giới hạn tổng số pending order bằng `InpMaxPendingOrders`
+- hết hạn theo số nến M2 bằng `InpPendingExpiryBars`
+- kiểm tra khoảng cách tối thiểu bằng `InpMinPendingDistancePoints`
+- hủy pending nếu regime đảo mạnh hoặc giá đi quá xa vùng dự kiến
+- chống treo lệnh trùng gần cùng vùng giá
+
 ## Lot và risk
 
 Mặc định `InpLotMode = LOT_SMART`.
@@ -80,6 +96,7 @@ LamborghiniEA_journal.csv
 ```
 
 File nằm trong thư mục MT5 common files khi `InpWriteJournal = true`. Journal ghi entry, reject reason, exit, score, SL/TP, lot, RR, spread, equity và drawdown.
+Journal cũng ghi `execution` và `order_price` để phân tích Market/Limit/Stop trong backtest.
 
 ## Backtest gợi ý
 
@@ -110,7 +127,7 @@ Các phần sau chưa nằm trong prototype MQL5 này:
 - Python learning engine.
 - Shadow/candidate/live model promotion.
 - AI vision second opinion.
-- Limit/stop pending entry nâng cao.
+- Stop-limit nâng cao và quản lý partial fill chi tiết.
 - Smart trim chi tiết theo từng ticket.
 - Database phục hồi nâng cao ngoài Global Variables và MT5 positions.
 
