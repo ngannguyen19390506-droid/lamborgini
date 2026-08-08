@@ -1,0 +1,1956 @@
+//+------------------------------------------------------------------+
+//|                                               LamborghiniEA.mq5   |
+//| Prototype EA for XAUUSD M2/M5 execution with M15 context.         |
+//| This is not financial advice. Backtest and demo-test first.       |
+//+------------------------------------------------------------------+
+#property copyright "Lamborghini EA"
+#property link      "https://github.com/ngannguyen19390506-droid/lamborgini"
+#property version   "1.00"
+#property strict
+
+#include <Trade/Trade.mqh>
+
+enum Direction
+{
+   DIR_NONE = 0,
+   DIR_BUY  = 1,
+   DIR_SELL = -1
+};
+
+enum MarketRegime
+{
+   REGIME_UNKNOWN = 0,
+   REGIME_STRONG_UPTREND,
+   REGIME_UPTREND,
+   REGIME_STRONG_DOWNTREND,
+   REGIME_DOWNTREND,
+   REGIME_RANGE,
+   REGIME_COMPRESSION,
+   REGIME_BREAKOUT,
+   REGIME_HIGH_VOLATILITY,
+   REGIME_CHAOTIC
+};
+
+enum TradingState
+{
+   STATE_RUNNING = 0,
+   STATE_NO_NEW_ENTRY,
+   STATE_RECOVERY_ONLY,
+   STATE_CLOSE_ONLY,
+   STATE_PAUSED,
+   STATE_EMERGENCY
+};
+
+enum LotMode
+{
+   LOT_FIXED = 0,
+   LOT_RISK_PERCENT,
+   LOT_SMART
+};
+
+struct RegimeInfo
+{
+   MarketRegime regime;
+   double emaFast;
+   double emaSlow;
+   double emaGapAtr;
+   double emaSlopeAtr;
+   double atr;
+   double atrRatio;
+   double adx;
+   double bbWidthAtr;
+   string label;
+};
+
+struct BasketInfo
+{
+   int count;
+   double lots;
+   double avgPrice;
+   double floating;
+   double weightedPrice;
+   double lastEntryPrice;
+   datetime lastEntryTime;
+};
+
+struct SignalFeatures
+{
+   bool sweep;
+   bool reclaim;
+   bool choch;
+   bool engulfing;
+   bool pinbar;
+   bool rejection;
+   int score;
+   string tags;
+};
+
+struct TradeSignal
+{
+   bool valid;
+   Direction direction;
+   string strategy;
+   int score;
+   double idealEntry;
+   double sl;
+   double tp;
+   double invalidation;
+   double rr;
+   string reason;
+};
+
+input group "Core"
+input string          InpTradeSymbol              = "XAUUSD";
+input ulong           InpMagicNumber              = 19390506;
+input ENUM_TIMEFRAMES InpContextTf                = PERIOD_M15;
+input ENUM_TIMEFRAMES InpSetupTf                  = PERIOD_M5;
+input ENUM_TIMEFRAMES InpTriggerTf                = PERIOD_M2;
+input TradingState    InpManualState              = STATE_RUNNING;
+input bool            InpAllowHedgedBaskets       = true;
+input bool            InpOneEntryPerM2Bar         = true;
+
+input group "Signal Scoring"
+input int             InpMinEntryScore            = 75;
+input int             InpMinRecoveryScore         = 83;
+input int             InpRecoveryScoreStep        = 5;
+input int             InpMinPyramidScore          = 80;
+input int             InpCounterTrendScoreBump    = 8;
+input bool            InpAllowCounterTrendReversal= true;
+
+input group "Indicators"
+input int             InpEmaFast                  = 21;
+input int             InpEmaSlow                  = 55;
+input int             InpAtrPeriod                = 14;
+input int             InpAdxPeriod                = 14;
+input int             InpRsiPeriod                = 14;
+input int             InpBandsPeriod              = 20;
+input double          InpBandsDeviation           = 2.0;
+
+input group "Regime"
+input double          InpStrongTrendAdx           = 27.0;
+input double          InpTrendAdx                 = 18.0;
+input double          InpRangeAdx                 = 17.0;
+input double          InpCompressionBbAtr         = 2.10;
+input double          InpCompressionAtrRatio      = 0.80;
+input double          InpHighVolAtrRatio          = 1.80;
+input double          InpChaoticAtrRatio          = 2.40;
+input double          InpMaxEmaAtrDistance        = 1.45;
+
+input group "Strategy Lookbacks"
+input int             InpStructureLookback        = 8;
+input int             InpSweepLookback            = 10;
+input int             InpChochLookback            = 5;
+input int             InpFvgLookback              = 30;
+input int             InpBreakoutLookback         = 28;
+input int             InpTargetLookback           = 42;
+input double          InpZoneAtrBuffer            = 0.25;
+
+input group "Entry And Exit"
+input double          InpAtrSlBuffer              = 0.35;
+input double          InpMinExpectedRR            = 1.45;
+input double          InpDefaultRR                = 2.00;
+input bool            InpUseRoomToTargetFilter    = true;
+input bool            InpSkipIfRoomTooSmall       = false;
+input double          InpMaxEntryAtrDeviation     = 0.35;
+input int             InpMaxSlippagePoints        = 40;
+
+input group "Lot Management"
+input LotMode         InpLotMode                   = LOT_SMART;
+input double          InpFixedLot                  = 0.02;
+input double          InpRiskPerTradePct           = 0.35;
+input double          InpMinLot                    = 0.01;
+input double          InpMaxInitialLot             = 0.10;
+input double          InpMaxReentryLot             = 0.10;
+input double          InpPyramidLotFactor          = 0.70;
+input double          InpRecoveryLotAddPct         = 0.00;
+input bool            InpAllowMinLotWhenRiskSmall  = false;
+
+input group "Risk Supervisor"
+input double          InpRecoveryOnlyDdPct         = 10.0;
+input double          InpMaxDrawdownPct            = 15.0;
+input double          InpEmergencyDrawdownPct      = 25.0;
+input bool            InpEmergencyCloseAll         = false;
+input double          InpMaxFloatingLossMoney      = 0.0;
+input double          InpMaxBasketLossMoney        = 0.0;
+input double          InpMaxBasketRiskPct          = 1.50;
+input double          InpMaxBasketLot              = 0.25;
+input double          InpMaxTotalLot               = 0.40;
+input int             InpMaxPositionsPerBasket     = 3;
+input int             InpMaxTradesPerHour          = 6;
+input int             InpMaxConsecutiveLosses      = 5;
+input double          InpMaxMarginUsagePct         = 45.0;
+input int             InpMaxSpreadPoints           = 120;
+input double          InpMinReentrySpacingAtr      = 0.70;
+
+input group "Basket Management"
+input bool            InpUseBasketTrailing         = true;
+input double          InpBasketTrailStartMoney     = 5.0;
+input double          InpBasketTrailLockMoney      = 3.0;
+input double          InpBasketTrailGivebackMoney  = 2.0;
+input bool            InpCloseInvalidatedBasket    = false;
+input bool            InpUseCrossBasketNetExit     = true;
+input double          InpCrossBasketNetTargetMoney = 8.0;
+input double          InpCrossBasketOffsetRatio    = 1.20;
+
+input group "Session"
+input bool            InpUseSessionScore           = true;
+input bool            InpHardSessionFilter         = false;
+input bool            InpTradeAsian                = false;
+input bool            InpTradeLondon               = true;
+input bool            InpTradeNewYork              = true;
+input int             InpCustomSessionStartGmt     = -1;
+input int             InpCustomSessionEndGmt       = -1;
+
+input group "Journal"
+input bool            InpWriteJournal              = true;
+input string          InpJournalFileName           = "LamborghiniEA_journal.csv";
+
+CTrade Trade;
+
+string TradeSymbol = "";
+
+int hEmaFastContext = INVALID_HANDLE;
+int hEmaSlowContext = INVALID_HANDLE;
+int hEmaFastSetup   = INVALID_HANDLE;
+int hEmaSlowSetup   = INVALID_HANDLE;
+int hEmaFastTrigger = INVALID_HANDLE;
+int hAtrContext     = INVALID_HANDLE;
+int hAtrSetup       = INVALID_HANDLE;
+int hAtrTrigger     = INVALID_HANDLE;
+int hAdxContext     = INVALID_HANDLE;
+int hAdxSetup       = INVALID_HANDLE;
+int hRsiTrigger     = INVALID_HANDLE;
+int hBandsContext   = INVALID_HANDLE;
+int hBandsSetup     = INVALID_HANDLE;
+
+datetime g_lastSignalBar = 0;
+datetime g_lastBuyEntryBar = 0;
+datetime g_lastSellEntryBar = 0;
+double g_peakEquity = 0.0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   TradeSymbol = (InpTradeSymbol == "" ? _Symbol : InpTradeSymbol);
+   if(!SymbolSelect(TradeSymbol, true))
+   {
+      Print("Cannot select symbol: ", TradeSymbol);
+      return INIT_FAILED;
+   }
+
+   hEmaFastContext = iMA(TradeSymbol, InpContextTf, InpEmaFast, 0, MODE_EMA, PRICE_CLOSE);
+   hEmaSlowContext = iMA(TradeSymbol, InpContextTf, InpEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
+   hEmaFastSetup   = iMA(TradeSymbol, InpSetupTf,   InpEmaFast, 0, MODE_EMA, PRICE_CLOSE);
+   hEmaSlowSetup   = iMA(TradeSymbol, InpSetupTf,   InpEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
+   hEmaFastTrigger = iMA(TradeSymbol, InpTriggerTf, InpEmaFast, 0, MODE_EMA, PRICE_CLOSE);
+   hAtrContext     = iATR(TradeSymbol, InpContextTf, InpAtrPeriod);
+   hAtrSetup       = iATR(TradeSymbol, InpSetupTf,   InpAtrPeriod);
+   hAtrTrigger     = iATR(TradeSymbol, InpTriggerTf, InpAtrPeriod);
+   hAdxContext     = iADX(TradeSymbol, InpContextTf, InpAdxPeriod);
+   hAdxSetup       = iADX(TradeSymbol, InpSetupTf,   InpAdxPeriod);
+   hRsiTrigger     = iRSI(TradeSymbol, InpTriggerTf, InpRsiPeriod, PRICE_CLOSE);
+   hBandsContext   = iBands(TradeSymbol, InpContextTf, InpBandsPeriod, 0, InpBandsDeviation, PRICE_CLOSE);
+   hBandsSetup     = iBands(TradeSymbol, InpSetupTf,   InpBandsPeriod, 0, InpBandsDeviation, PRICE_CLOSE);
+
+   if(!IndicatorsReady())
+      return INIT_FAILED;
+
+   Trade.SetExpertMagicNumber(InpMagicNumber);
+   Trade.SetDeviationInPoints(InpMaxSlippagePoints);
+   Trade.SetTypeFillingBySymbol(TradeSymbol);
+
+   string peakKey = GvKey("PeakEquity");
+   if(GlobalVariableCheck(peakKey))
+      g_peakEquity = GlobalVariableGet(peakKey);
+   else
+   {
+      g_peakEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      GlobalVariableSet(peakKey, g_peakEquity);
+   }
+
+   InitJournal();
+
+   Print("LamborghiniEA initialized on ", TradeSymbol,
+         ". Attach to the traded symbol chart for live ticks.");
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   ReleaseHandle(hEmaFastContext);
+   ReleaseHandle(hEmaSlowContext);
+   ReleaseHandle(hEmaFastSetup);
+   ReleaseHandle(hEmaSlowSetup);
+   ReleaseHandle(hEmaFastTrigger);
+   ReleaseHandle(hAtrContext);
+   ReleaseHandle(hAtrSetup);
+   ReleaseHandle(hAtrTrigger);
+   ReleaseHandle(hAdxContext);
+   ReleaseHandle(hAdxSetup);
+   ReleaseHandle(hRsiTrigger);
+   ReleaseHandle(hBandsContext);
+   ReleaseHandle(hBandsSetup);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick                                                       |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!MarketDataReady())
+      return;
+
+   UpdatePeakEquity();
+
+   BasketInfo buyBasket;
+   BasketInfo sellBasket;
+   BuildBasket(DIR_BUY, buyBasket);
+   BuildBasket(DIR_SELL, sellBasket);
+
+   RegimeInfo regime = DetectRegime();
+   ManageBaskets(regime, buyBasket, sellBasket);
+
+   TradingState state = EffectiveTradingState(buyBasket, sellBasket);
+   if(state == STATE_EMERGENCY && InpEmergencyCloseAll)
+   {
+      CloseAllOwnedPositions("EMERGENCY_DD");
+      return;
+   }
+
+   datetime currentM2Bar = iTime(TradeSymbol, InpTriggerTf, 0);
+   if(currentM2Bar == 0)
+      return;
+
+   if(InpOneEntryPerM2Bar && currentM2Bar == g_lastSignalBar)
+      return;
+
+   g_lastSignalBar = currentM2Bar;
+
+   TradeSignal best = FindBestSignal(regime);
+   if(!best.valid)
+      return;
+
+   TryOpenSignal(best, state);
+}
+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD || trans.deal == 0)
+      return;
+
+   if(!HistoryDealSelect(trans.deal))
+      return;
+
+   string symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+   long magic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+   if(symbol != TradeSymbol || magic != (long)InpMagicNumber)
+      return;
+
+   long entryType = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(entryType != DEAL_ENTRY_OUT && entryType != DEAL_ENTRY_INOUT)
+      return;
+
+   double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
+                 + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
+                 + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+   string side = (HistoryDealGetInteger(trans.deal, DEAL_TYPE) == DEAL_TYPE_BUY ? "BUY" : "SELL");
+   WriteJournal("EXIT", side, "", "", 0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, profit, "deal_close");
+}
+
+//+------------------------------------------------------------------+
+//| Signal selection                                                  |
+//+------------------------------------------------------------------+
+TradeSignal FindBestSignal(const RegimeInfo &regime)
+{
+   TradeSignal best = EmptySignal();
+   KeepBest(best, DetectTrendPullback(DIR_BUY, regime));
+   KeepBest(best, DetectTrendPullback(DIR_SELL, regime));
+   KeepBest(best, DetectLiquiditySweep(DIR_BUY, regime));
+   KeepBest(best, DetectLiquiditySweep(DIR_SELL, regime));
+   KeepBest(best, DetectFvgRetracement(DIR_BUY, regime));
+   KeepBest(best, DetectFvgRetracement(DIR_SELL, regime));
+   KeepBest(best, DetectBreakoutRetest(DIR_BUY, regime));
+   KeepBest(best, DetectBreakoutRetest(DIR_SELL, regime));
+   return best;
+}
+
+void KeepBest(TradeSignal &best, const TradeSignal &candidate)
+{
+   if(!candidate.valid)
+      return;
+   if(!best.valid || candidate.score > best.score)
+      best = candidate;
+}
+
+TradeSignal DetectTrendPullback(const Direction dir, const RegimeInfo &regime)
+{
+   TradeSignal s = EmptySignal();
+   s.direction = dir;
+   s.strategy = "TrendPullback";
+
+   if(IsStrongOpposite(dir, regime.regime))
+      return s;
+
+   double emaFast = BufferValue(hEmaFastSetup, 0, 1);
+   double emaSlow = BufferValue(hEmaSlowSetup, 0, 1);
+   double atr = BufferValue(hAtrSetup, 0, 1);
+   if(atr <= 0.0)
+      return s;
+
+   double close1 = iClose(TradeSymbol, InpSetupTf, 1);
+   double high1 = iHigh(TradeSymbol, InpSetupTf, 1);
+   double low1 = iLow(TradeSymbol, InpSetupTf, 1);
+
+   bool trendOk = (dir == DIR_BUY ? emaFast >= emaSlow : emaFast <= emaSlow);
+   if(!trendOk && regime.regime != REGIME_RANGE)
+      return s;
+
+   bool touchedZone = false;
+   if(dir == DIR_BUY)
+      touchedZone = (low1 <= emaFast + atr * InpZoneAtrBuffer && close1 >= emaSlow);
+   else
+      touchedZone = (high1 >= emaFast - atr * InpZoneAtrBuffer && close1 <= emaSlow);
+
+   double price = CurrentEntryPrice(dir);
+   double distanceAtr = MathAbs(price - emaFast) / atr;
+   if(!touchedZone || distanceAtr > InpMaxEmaAtrDistance)
+      return s;
+
+   SignalFeatures pa = AnalyzeTriggerPriceAction(dir);
+   if(pa.score < 5)
+      return s;
+
+   int setupScore = 11;
+   double fvgLow = 0.0;
+   double fvgHigh = 0.0;
+   int locationScore = 7 + (NearSupportResistance(dir, InpSetupTf) ? 4 : 0)
+                         + (FindActiveFvg(dir, fvgLow, fvgHigh) ? 4 : 0);
+   locationScore = ClampInt(locationScore, 0, 15);
+
+   s.score = BuildScore(dir, regime, setupScore, locationScore, pa, "TrendPullback");
+   s.reason = StringFormat("regime=%s; zone=ema; distAtr=%.2f; pa=%s",
+                           regime.label, distanceAtr, pa.tags);
+
+   double invalidation = (dir == DIR_BUY)
+                         ? MathMin(LowestLow(InpTriggerTf, 1, 5), emaSlow)
+                         : MathMax(HighestHigh(InpTriggerTf, 1, 5), emaSlow);
+   if(!CompleteSignalPrices(s, invalidation))
+      return EmptySignal();
+
+   s.valid = true;
+   return s;
+}
+
+TradeSignal DetectLiquiditySweep(const Direction dir, const RegimeInfo &regime)
+{
+   TradeSignal s = EmptySignal();
+   s.direction = dir;
+   s.strategy = "LiquiditySweep";
+
+   if(IsStrongOpposite(dir, regime.regime) && !InpAllowCounterTrendReversal)
+      return s;
+
+   SignalFeatures pa = AnalyzeTriggerPriceAction(dir);
+   if(!(pa.sweep && pa.reclaim))
+      return s;
+
+   if(pa.score < 8)
+      return s;
+
+   int setupScore = 13;
+   int locationScore = 9 + (NearSupportResistance(dir, InpSetupTf) ? 4 : 0)
+                         + (IsPriceStretched(dir) ? 2 : 0);
+   locationScore = ClampInt(locationScore, 0, 15);
+
+   s.score = BuildScore(dir, regime, setupScore, locationScore, pa, "LiquiditySweep");
+   if(IsStrongOpposite(dir, regime.regime))
+      s.score -= InpCounterTrendScoreBump;
+
+   s.reason = StringFormat("regime=%s; sweep_reclaim=true; pa=%s", regime.label, pa.tags);
+
+   double invalidation = (dir == DIR_BUY)
+                         ? iLow(TradeSymbol, InpTriggerTf, 1)
+                         : iHigh(TradeSymbol, InpTriggerTf, 1);
+   if(!CompleteSignalPrices(s, invalidation))
+      return EmptySignal();
+
+   s.valid = true;
+   return s;
+}
+
+TradeSignal DetectFvgRetracement(const Direction dir, const RegimeInfo &regime)
+{
+   TradeSignal s = EmptySignal();
+   s.direction = dir;
+   s.strategy = "FVGRetracement";
+
+   if(IsStrongOpposite(dir, regime.regime))
+      return s;
+
+   double zoneLow = 0.0;
+   double zoneHigh = 0.0;
+   if(!FindActiveFvg(dir, zoneLow, zoneHigh))
+      return s;
+
+   SignalFeatures pa = AnalyzeTriggerPriceAction(dir);
+   if(pa.score < 5)
+      return s;
+
+   int setupScore = 12;
+   int locationScore = 13 + (NearSupportResistance(dir, InpSetupTf) ? 2 : 0);
+   locationScore = ClampInt(locationScore, 0, 15);
+
+   s.score = BuildScore(dir, regime, setupScore, locationScore, pa, "FVGRetracement");
+   s.reason = StringFormat("regime=%s; fvg=%.2f-%.2f; pa=%s",
+                           regime.label, zoneLow, zoneHigh, pa.tags);
+
+   double invalidation = (dir == DIR_BUY) ? zoneLow : zoneHigh;
+   if(!CompleteSignalPrices(s, invalidation))
+      return EmptySignal();
+
+   s.valid = true;
+   return s;
+}
+
+TradeSignal DetectBreakoutRetest(const Direction dir, const RegimeInfo &regime)
+{
+   TradeSignal s = EmptySignal();
+   s.direction = dir;
+   s.strategy = "BreakoutRetest";
+
+   if(regime.regime != REGIME_COMPRESSION && regime.regime != REGIME_BREAKOUT &&
+      regime.regime != REGIME_RANGE)
+      return s;
+
+   double atr = BufferValue(hAtrSetup, 0, 1);
+   if(atr <= 0.0)
+      return s;
+
+   double rangeHigh = HighestHigh(InpSetupTf, 2, InpBreakoutLookback);
+   double rangeLow = LowestLow(InpSetupTf, 2, InpBreakoutLookback);
+   double close1 = iClose(TradeSymbol, InpSetupTf, 1);
+   double price = CurrentEntryPrice(dir);
+
+   bool breakout = false;
+   bool retest = false;
+   double boundary = 0.0;
+
+   if(dir == DIR_BUY)
+   {
+      breakout = close1 > rangeHigh;
+      boundary = rangeHigh;
+      retest = price <= boundary + atr * 0.45 && price >= boundary - atr * 0.25;
+   }
+   else
+   {
+      breakout = close1 < rangeLow;
+      boundary = rangeLow;
+      retest = price >= boundary - atr * 0.45 && price <= boundary + atr * 0.25;
+   }
+
+   if(!breakout || !retest)
+      return s;
+
+   SignalFeatures pa = AnalyzeTriggerPriceAction(dir);
+   if(pa.score < 4)
+      return s;
+
+   int setupScore = 12;
+   int locationScore = 12;
+   s.score = BuildScore(dir, regime, setupScore, locationScore, pa, "BreakoutRetest");
+   s.reason = StringFormat("regime=%s; boundary=%.2f; pa=%s", regime.label, boundary, pa.tags);
+
+   double invalidation = (dir == DIR_BUY) ? boundary - atr * 0.25 : boundary + atr * 0.25;
+   if(!CompleteSignalPrices(s, invalidation))
+      return EmptySignal();
+
+   s.valid = true;
+   return s;
+}
+
+//+------------------------------------------------------------------+
+//| Entry and risk                                                    |
+//+------------------------------------------------------------------+
+void TryOpenSignal(const TradeSignal &signal, const TradingState state)
+{
+   BasketInfo sameBasket;
+   BasketInfo oppositeBasket;
+   BuildBasket(signal.direction, sameBasket);
+   BuildBasket(OppositeDirection(signal.direction), oppositeBasket);
+
+   bool hasBasket = sameBasket.count > 0;
+   bool isRecovery = hasBasket && sameBasket.floating < 0.0;
+   bool isPyramid = hasBasket && sameBasket.floating >= 0.0;
+
+   if(!StateAllowsEntry(state, hasBasket, isRecovery))
+   {
+      WriteJournal("REJECT_STATE", DirectionName(signal.direction), signal.strategy,
+                   StateName(state), signal.score, signal.idealEntry, signal.sl, signal.tp,
+                   0.0, 0.0, 0.0, 0.0, signal.reason);
+      return;
+   }
+
+   if(!InpAllowHedgedBaskets && oppositeBasket.count > 0)
+      return;
+
+   int requiredScore = RequiredScoreFor(signal.direction, sameBasket, isRecovery, isPyramid);
+   if(signal.score < requiredScore)
+   {
+      WriteJournal("REJECT_SCORE", DirectionName(signal.direction), signal.strategy,
+                   "", signal.score, signal.idealEntry, signal.sl, signal.tp,
+                   0.0, 0.0, 0.0, 0.0,
+                   StringFormat("required=%d; %s", requiredScore, signal.reason));
+      return;
+   }
+
+   if(sameBasket.count >= InpMaxPositionsPerBasket)
+   {
+      WriteJournal("REJECT_BASKET_COUNT", DirectionName(signal.direction), signal.strategy,
+                   "", signal.score, signal.idealEntry, signal.sl, signal.tp,
+                   0.0, 0.0, 0.0, 0.0, signal.reason);
+      return;
+   }
+
+   if(isRecovery && IsBasketInvalidated(signal.direction, DetectRegime()))
+   {
+      WriteJournal("REJECT_INVALIDATED", DirectionName(signal.direction), signal.strategy,
+                   "", signal.score, signal.idealEntry, signal.sl, signal.tp,
+                   0.0, 0.0, 0.0, 0.0, signal.reason);
+      return;
+   }
+
+   if(!ExecutionGuard(signal, sameBasket))
+      return;
+
+   double lot = CalculateLot(signal, sameBasket, isRecovery, isPyramid);
+   if(lot <= 0.0)
+   {
+      WriteJournal("REJECT_LOT", DirectionName(signal.direction), signal.strategy,
+                   "", signal.score, signal.idealEntry, signal.sl, signal.tp,
+                   lot, 0.0, 0.0, 0.0, signal.reason);
+      return;
+   }
+
+   if(!ExposureGuard(signal, lot, sameBasket))
+      return;
+
+   string comment = StringFormat("Lambo|%s|%d", ShortStrategyName(signal.strategy), signal.score);
+   bool ok = false;
+   ResetLastError();
+   if(signal.direction == DIR_BUY)
+      ok = Trade.Buy(lot, TradeSymbol, 0.0, signal.sl, signal.tp, comment);
+   else if(signal.direction == DIR_SELL)
+      ok = Trade.Sell(lot, TradeSymbol, 0.0, signal.sl, signal.tp, comment);
+
+   double retcode = (double)Trade.ResultRetcode();
+   string resultText = Trade.ResultRetcodeDescription();
+
+   if(ok)
+   {
+      datetime bar = iTime(TradeSymbol, InpTriggerTf, 0);
+      if(signal.direction == DIR_BUY)
+         g_lastBuyEntryBar = bar;
+      else
+         g_lastSellEntryBar = bar;
+      WriteJournal((isRecovery ? "ENTRY_RECOVERY" : (isPyramid ? "ENTRY_PYRAMID" : "ENTRY")),
+                   DirectionName(signal.direction), signal.strategy, RegimeName(DetectRegime().regime),
+                   signal.score, signal.idealEntry, signal.sl, signal.tp, lot,
+                   signal.rr, SpreadPoints(), 0.0, signal.reason);
+   }
+   else
+   {
+      WriteJournal("ORDER_FAILED", DirectionName(signal.direction), signal.strategy,
+                   resultText, signal.score, signal.idealEntry, signal.sl, signal.tp,
+                   lot, signal.rr, SpreadPoints(), retcode, signal.reason);
+   }
+}
+
+bool ExecutionGuard(const TradeSignal &signal, const BasketInfo &sameBasket)
+{
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+      return false;
+
+   if(SpreadPoints() > InpMaxSpreadPoints)
+   {
+      WriteJournal("REJECT_SPREAD", DirectionName(signal.direction), signal.strategy, "",
+                   signal.score, signal.idealEntry, signal.sl, signal.tp,
+                   0.0, signal.rr, SpreadPoints(), 0.0, signal.reason);
+      return false;
+   }
+
+   if(InpHardSessionFilter && !IsInAllowedSession())
+   {
+      WriteJournal("REJECT_SESSION", DirectionName(signal.direction), signal.strategy, "",
+                   signal.score, signal.idealEntry, signal.sl, signal.tp,
+                   0.0, signal.rr, SpreadPoints(), 0.0, signal.reason);
+      return false;
+   }
+
+   double atr = BufferValue(hAtrTrigger, 0, 1);
+   double price = CurrentEntryPrice(signal.direction);
+   if(atr > 0.0 && MathAbs(price - signal.idealEntry) > atr * InpMaxEntryAtrDeviation)
+   {
+      WriteJournal("REJECT_CHASE", DirectionName(signal.direction), signal.strategy, "",
+                   signal.score, signal.idealEntry, signal.sl, signal.tp,
+                   0.0, signal.rr, SpreadPoints(), 0.0,
+                   StringFormat("price=%.2f; %s", price, signal.reason));
+      return false;
+   }
+
+   if(sameBasket.count > 0)
+   {
+      double spacing = MathAbs(price - sameBasket.lastEntryPrice);
+      double minSpacing = BufferValue(hAtrSetup, 0, 1) * InpMinReentrySpacingAtr;
+      if(minSpacing > 0.0 && spacing < minSpacing)
+      {
+         WriteJournal("REJECT_SPACING", DirectionName(signal.direction), signal.strategy, "",
+                      signal.score, signal.idealEntry, signal.sl, signal.tp,
+                      0.0, signal.rr, SpreadPoints(), 0.0,
+                      StringFormat("spacing=%.2f; min=%.2f; %s", spacing, minSpacing, signal.reason));
+         return false;
+      }
+   }
+
+   if(TradesLastHour() >= InpMaxTradesPerHour)
+      return false;
+
+   if(ConsecutiveLosses() >= InpMaxConsecutiveLosses)
+      return false;
+
+   return true;
+}
+
+double CalculateLot(const TradeSignal &signal,
+                    const BasketInfo &sameBasket,
+                    const bool isRecovery,
+                    const bool isPyramid)
+{
+   double lot = InpFixedLot;
+   if(InpLotMode != LOT_FIXED)
+   {
+      double entry = CurrentEntryPrice(signal.direction);
+      double stopDistance = MathAbs(entry - signal.sl);
+      double riskPerLot = MoneyRiskPerLot(stopDistance);
+      if(riskPerLot <= 0.0)
+         return 0.0;
+
+      double baseRiskPct = InpRiskPerTradePct;
+      double riskMoney = AccountInfoDouble(ACCOUNT_EQUITY) * baseRiskPct / 100.0;
+      riskMoney *= ScoreLotModifier(signal.score);
+
+      if(InpLotMode == LOT_SMART)
+      {
+         riskMoney *= DrawdownLotModifier();
+         riskMoney *= VolatilityLotModifier();
+         riskMoney *= ExposureLotModifier();
+      }
+
+      lot = riskMoney / riskPerLot;
+   }
+
+   if(isRecovery)
+   {
+      lot *= (1.0 + InpRecoveryLotAddPct * sameBasket.count / 100.0);
+      lot = MathMin(lot, InpMaxReentryLot);
+   }
+   else if(isPyramid)
+   {
+      lot *= MathPow(MathMax(0.10, InpPyramidLotFactor), sameBasket.count);
+      lot = MathMin(lot, InpMaxReentryLot);
+   }
+   else
+   {
+      lot = MathMin(lot, InpMaxInitialLot);
+   }
+
+   lot = NormalizeVolume(lot);
+
+   if(lot <= 0.0 && InpAllowMinLotWhenRiskSmall)
+      lot = NormalizeVolume(MinBrokerLot());
+
+   return lot;
+}
+
+bool ExposureGuard(const TradeSignal &signal, const double newLot, const BasketInfo &sameBasket)
+{
+   BasketInfo buyBasket;
+   BasketInfo sellBasket;
+   BuildBasket(DIR_BUY, buyBasket);
+   BuildBasket(DIR_SELL, sellBasket);
+   double totalLots = buyBasket.lots + sellBasket.lots;
+   if(totalLots + newLot > InpMaxTotalLot)
+      return false;
+
+   if(sameBasket.lots + newLot > InpMaxBasketLot)
+      return false;
+
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity > 0.0 && InpMaxBasketRiskPct > 0.0)
+   {
+      // Approximate added hard risk from the new order. Existing floating loss is
+      // included so recovery cannot keep increasing exposure after a bad thesis.
+      double stopDistance = MathAbs(CurrentEntryPrice(signal.direction) - signal.sl);
+      double riskMoney = MoneyRiskPerLot(stopDistance) * newLot + MathMax(0.0, -sameBasket.floating);
+      double riskPct = riskMoney / equity * 100.0;
+      if(riskPct > InpMaxBasketRiskPct)
+         return false;
+   }
+
+   return true;
+}
+
+int RequiredScoreFor(const Direction dir,
+                     const BasketInfo &basket,
+                     const bool isRecovery,
+                     const bool isPyramid)
+{
+   if(basket.count <= 0)
+      return InpMinEntryScore;
+   if(isRecovery)
+      return InpMinRecoveryScore + MathMax(0, basket.count - 1) * InpRecoveryScoreStep;
+   if(isPyramid)
+      return InpMinPyramidScore;
+   return InpMinEntryScore;
+}
+
+bool StateAllowsEntry(const TradingState state,
+                      const bool hasBasket,
+                      const bool isRecovery)
+{
+   if(state == STATE_RUNNING)
+      return true;
+   if(state == STATE_RECOVERY_ONLY)
+      return hasBasket && isRecovery;
+   return false;
+}
+
+TradingState EffectiveTradingState(const BasketInfo &buyBasket,
+                                   const BasketInfo &sellBasket)
+{
+   if(InpManualState != STATE_RUNNING)
+      return InpManualState;
+
+   double dd = CurrentDrawdownPct();
+   double floating = buyBasket.floating + sellBasket.floating;
+   double marginUsage = MarginUsagePct();
+
+   if(dd >= InpEmergencyDrawdownPct)
+      return STATE_EMERGENCY;
+   if(dd >= InpMaxDrawdownPct)
+      return STATE_NO_NEW_ENTRY;
+   if(dd >= InpRecoveryOnlyDdPct)
+      return STATE_RECOVERY_ONLY;
+   if(InpMaxFloatingLossMoney > 0.0 && floating <= -InpMaxFloatingLossMoney)
+      return STATE_NO_NEW_ENTRY;
+   if(InpMaxBasketLossMoney > 0.0 &&
+      (buyBasket.floating <= -InpMaxBasketLossMoney || sellBasket.floating <= -InpMaxBasketLossMoney))
+      return STATE_NO_NEW_ENTRY;
+   if(marginUsage >= InpMaxMarginUsagePct)
+      return STATE_NO_NEW_ENTRY;
+   if(ConsecutiveLosses() >= InpMaxConsecutiveLosses)
+      return STATE_NO_NEW_ENTRY;
+
+   return STATE_RUNNING;
+}
+
+//+------------------------------------------------------------------+
+//| Basket management                                                 |
+//+------------------------------------------------------------------+
+void ManageBaskets(const RegimeInfo &regime,
+                   const BasketInfo &buyBasket,
+                   const BasketInfo &sellBasket)
+{
+   if(InpUseBasketTrailing)
+   {
+      ManageBasketTrailing(DIR_BUY, buyBasket);
+      ManageBasketTrailing(DIR_SELL, sellBasket);
+   }
+
+   if(InpCloseInvalidatedBasket)
+   {
+      if(buyBasket.count > 0 && buyBasket.floating < 0.0 && IsBasketInvalidated(DIR_BUY, regime))
+         CloseBasket(DIR_BUY, "BUY_INVALIDATED");
+      if(sellBasket.count > 0 && sellBasket.floating < 0.0 && IsBasketInvalidated(DIR_SELL, regime))
+         CloseBasket(DIR_SELL, "SELL_INVALIDATED");
+   }
+
+   if(InpUseCrossBasketNetExit && buyBasket.count > 0 && sellBasket.count > 0)
+   {
+      double net = buyBasket.floating + sellBasket.floating;
+      double buyAbs = MathAbs(buyBasket.floating);
+      double sellAbs = MathAbs(sellBasket.floating);
+      bool enoughOffset = false;
+
+      if(buyBasket.floating > 0.0 && sellBasket.floating < 0.0)
+         enoughOffset = buyBasket.floating >= sellAbs * InpCrossBasketOffsetRatio;
+      if(sellBasket.floating > 0.0 && buyBasket.floating < 0.0)
+         enoughOffset = sellBasket.floating >= buyAbs * InpCrossBasketOffsetRatio;
+
+      if(net >= InpCrossBasketNetTargetMoney && enoughOffset)
+         CloseAllOwnedPositions("CROSS_BASKET_NET_EXIT");
+   }
+}
+
+void ManageBasketTrailing(const Direction dir, const BasketInfo &basket)
+{
+   string activeKey = GvKey(DirectionName(dir) + "_TrailActive");
+   string protectedKey = GvKey(DirectionName(dir) + "_TrailProtected");
+
+   if(basket.count <= 0)
+   {
+      GlobalVariableSet(activeKey, 0.0);
+      GlobalVariableSet(protectedKey, 0.0);
+      return;
+   }
+
+   bool active = GlobalVariableCheck(activeKey) && GlobalVariableGet(activeKey) > 0.5;
+   double protectedProfit = (GlobalVariableCheck(protectedKey) ? GlobalVariableGet(protectedKey) : 0.0);
+
+   if(!active && basket.floating >= InpBasketTrailStartMoney)
+   {
+      active = true;
+      protectedProfit = MathMax(InpBasketTrailLockMoney,
+                                basket.floating - InpBasketTrailGivebackMoney);
+      GlobalVariableSet(activeKey, 1.0);
+      GlobalVariableSet(protectedKey, protectedProfit);
+   }
+   else if(active)
+   {
+      double nextProtected = MathMax(protectedProfit,
+                                     basket.floating - InpBasketTrailGivebackMoney);
+      if(nextProtected > protectedProfit)
+      {
+         protectedProfit = nextProtected;
+         GlobalVariableSet(protectedKey, protectedProfit);
+      }
+
+      if(basket.floating <= protectedProfit)
+         CloseBasket(dir, "BASKET_TRAILING");
+   }
+}
+
+bool IsBasketInvalidated(const Direction dir, const RegimeInfo &regime)
+{
+   double emaFast = BufferValue(hEmaFastSetup, 0, 1);
+   double emaSlow = BufferValue(hEmaSlowSetup, 0, 1);
+   double adx = BufferValue(hAdxSetup, 0, 1);
+
+   if(dir == DIR_BUY)
+   {
+      bool contextFlip = regime.regime == REGIME_DOWNTREND ||
+                         regime.regime == REGIME_STRONG_DOWNTREND;
+      bool setupFlip = emaFast < emaSlow && StructureScore(DIR_SELL, InpSetupTf) >= 10;
+      return contextFlip && setupFlip && adx >= InpTrendAdx;
+   }
+
+   if(dir == DIR_SELL)
+   {
+      bool contextFlip = regime.regime == REGIME_UPTREND ||
+                         regime.regime == REGIME_STRONG_UPTREND;
+      bool setupFlip = emaFast > emaSlow && StructureScore(DIR_BUY, InpSetupTf) >= 10;
+      return contextFlip && setupFlip && adx >= InpTrendAdx;
+   }
+
+   return false;
+}
+
+void BuildBasket(const Direction dir, BasketInfo &basket)
+{
+   basket.count = 0;
+   basket.lots = 0.0;
+   basket.avgPrice = 0.0;
+   basket.floating = 0.0;
+   basket.weightedPrice = 0.0;
+   basket.lastEntryPrice = 0.0;
+   basket.lastEntryTime = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != TradeSymbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber)
+         continue;
+
+      long type = PositionGetInteger(POSITION_TYPE);
+      Direction posDir = (type == POSITION_TYPE_BUY ? DIR_BUY : DIR_SELL);
+      if(posDir != dir)
+         continue;
+
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
+
+      basket.count++;
+      basket.lots += volume;
+      basket.weightedPrice += openPrice * volume;
+      basket.floating += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+
+      if(openTime >= basket.lastEntryTime)
+      {
+         basket.lastEntryTime = openTime;
+         basket.lastEntryPrice = openPrice;
+      }
+   }
+
+   if(basket.lots > 0.0)
+      basket.avgPrice = basket.weightedPrice / basket.lots;
+}
+
+void CloseBasket(const Direction dir, const string reason)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != TradeSymbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber)
+         continue;
+
+      long type = PositionGetInteger(POSITION_TYPE);
+      Direction posDir = (type == POSITION_TYPE_BUY ? DIR_BUY : DIR_SELL);
+      if(posDir != dir)
+         continue;
+
+      Trade.PositionClose(ticket);
+   }
+
+   WriteJournal("CLOSE_BASKET", DirectionName(dir), "", "", 0, 0.0, 0.0, 0.0,
+                0.0, 0.0, SpreadPoints(), 0.0, reason);
+}
+
+void CloseAllOwnedPositions(const string reason)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != TradeSymbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber)
+         continue;
+
+      Trade.PositionClose(ticket);
+   }
+
+   WriteJournal("CLOSE_ALL", "", "", "", 0, 0.0, 0.0, 0.0,
+                0.0, 0.0, SpreadPoints(), 0.0, reason);
+}
+
+//+------------------------------------------------------------------+
+//| Regime and scoring                                                |
+//+------------------------------------------------------------------+
+RegimeInfo DetectRegime()
+{
+   RegimeInfo r;
+   r.regime = REGIME_UNKNOWN;
+   r.emaFast = BufferValue(hEmaFastContext, 0, 1);
+   r.emaSlow = BufferValue(hEmaSlowContext, 0, 1);
+   r.atr = BufferValue(hAtrContext, 0, 1);
+   r.adx = BufferValue(hAdxContext, 0, 1);
+   r.label = "UNKNOWN";
+
+   if(r.atr <= 0.0)
+      return r;
+
+   double emaFast4 = BufferValue(hEmaFastContext, 0, 4);
+   double bandsUpper = BufferValue(hBandsContext, 1, 1);
+   double bandsLower = BufferValue(hBandsContext, 2, 1);
+   double atrAvg = AverageBuffer(hAtrContext, 0, 2, 50);
+   if(atrAvg <= 0.0)
+      atrAvg = r.atr;
+
+   r.emaGapAtr = (r.emaFast - r.emaSlow) / r.atr;
+   r.emaSlopeAtr = (r.emaFast - emaFast4) / r.atr;
+   r.atrRatio = r.atr / atrAvg;
+   r.bbWidthAtr = (bandsUpper - bandsLower) / r.atr;
+
+   if(r.atrRatio >= InpChaoticAtrRatio && r.adx < InpTrendAdx)
+      r.regime = REGIME_CHAOTIC;
+   else if(r.atrRatio >= InpHighVolAtrRatio)
+      r.regime = REGIME_HIGH_VOLATILITY;
+   else if(r.bbWidthAtr <= InpCompressionBbAtr && r.atrRatio <= InpCompressionAtrRatio)
+      r.regime = REGIME_COMPRESSION;
+   else if(r.emaGapAtr > 0.40 && r.emaSlopeAtr > 0.06 && r.adx >= InpStrongTrendAdx)
+      r.regime = REGIME_STRONG_UPTREND;
+   else if(r.emaGapAtr > 0.12 && r.adx >= InpTrendAdx)
+      r.regime = REGIME_UPTREND;
+   else if(r.emaGapAtr < -0.40 && r.emaSlopeAtr < -0.06 && r.adx >= InpStrongTrendAdx)
+      r.regime = REGIME_STRONG_DOWNTREND;
+   else if(r.emaGapAtr < -0.12 && r.adx >= InpTrendAdx)
+      r.regime = REGIME_DOWNTREND;
+   else
+      r.regime = REGIME_RANGE;
+
+   r.label = RegimeName(r.regime);
+   return r;
+}
+
+int BuildScore(const Direction dir,
+               const RegimeInfo &regime,
+               const int setupScore,
+               const int locationScore,
+               const SignalFeatures &pa,
+               const string strategy)
+{
+   int score = 0;
+   score += DirectionContextScore(dir, regime.regime, strategy);       // 0..15
+   score += StructureScore(dir, InpSetupTf);                           // 0..15
+   score += ClampInt(setupScore, 0, 15);                               // 0..15
+   score += ClampInt(locationScore, 0, 15);                            // 0..15
+   score += ClampInt(pa.score, 0, 15);                                 // 0..15
+   score += MomentumScore(dir);                                        // 0..10
+   score += VolatilityScore(regime);                                   // 0..5
+   score += SpreadScore();                                             // 0..5
+   score += SessionScore();                                            // 0..5
+   return ClampInt(score, 0, 100);
+}
+
+int DirectionContextScore(const Direction dir,
+                          const MarketRegime regime,
+                          const string strategy)
+{
+   if(regime == REGIME_CHAOTIC)
+      return 0;
+
+   if(strategy == "BreakoutRetest" &&
+      (regime == REGIME_COMPRESSION || regime == REGIME_BREAKOUT || regime == REGIME_RANGE))
+      return 13;
+
+   if(strategy == "LiquiditySweep" && regime == REGIME_RANGE)
+      return 13;
+
+   if(dir == DIR_BUY)
+   {
+      if(regime == REGIME_STRONG_UPTREND) return 15;
+      if(regime == REGIME_UPTREND) return 13;
+      if(regime == REGIME_RANGE || regime == REGIME_COMPRESSION) return 8;
+      if(regime == REGIME_HIGH_VOLATILITY) return 5;
+      return 2;
+   }
+
+   if(dir == DIR_SELL)
+   {
+      if(regime == REGIME_STRONG_DOWNTREND) return 15;
+      if(regime == REGIME_DOWNTREND) return 13;
+      if(regime == REGIME_RANGE || regime == REGIME_COMPRESSION) return 8;
+      if(regime == REGIME_HIGH_VOLATILITY) return 5;
+      return 2;
+   }
+
+   return 0;
+}
+
+int StructureScore(const Direction dir, const ENUM_TIMEFRAMES tf)
+{
+   double recentHigh = HighestHigh(tf, 1, InpStructureLookback);
+   double recentLow = LowestLow(tf, 1, InpStructureLookback);
+   double previousHigh = HighestHigh(tf, InpStructureLookback + 1, InpStructureLookback);
+   double previousLow = LowestLow(tf, InpStructureLookback + 1, InpStructureLookback);
+
+   if(recentHigh == 0.0 || recentLow == 0.0 || previousHigh == 0.0 || previousLow == 0.0)
+      return 0;
+
+   if(dir == DIR_BUY)
+   {
+      if(recentHigh > previousHigh && recentLow > previousLow) return 15;
+      if(recentHigh > previousHigh || recentLow > previousLow) return 10;
+   }
+   else if(dir == DIR_SELL)
+   {
+      if(recentHigh < previousHigh && recentLow < previousLow) return 15;
+      if(recentHigh < previousHigh || recentLow < previousLow) return 10;
+   }
+
+   return 4;
+}
+
+int MomentumScore(const Direction dir)
+{
+   int score = 0;
+   double rsi = BufferValue(hRsiTrigger, 0, 1);
+   double emaNow = BufferValue(hEmaFastTrigger, 0, 1);
+   double emaPrev = BufferValue(hEmaFastTrigger, 0, 4);
+   double plusDi = BufferValue(hAdxSetup, 1, 1);
+   double minusDi = BufferValue(hAdxSetup, 2, 1);
+
+   if(dir == DIR_BUY)
+   {
+      if(rsi >= 48.0 && rsi <= 72.0) score += 4;
+      if(emaNow > emaPrev) score += 3;
+      if(plusDi > minusDi) score += 3;
+   }
+   else if(dir == DIR_SELL)
+   {
+      if(rsi <= 52.0 && rsi >= 28.0) score += 4;
+      if(emaNow < emaPrev) score += 3;
+      if(minusDi > plusDi) score += 3;
+   }
+
+   return ClampInt(score, 0, 10);
+}
+
+int VolatilityScore(const RegimeInfo &regime)
+{
+   if(regime.regime == REGIME_CHAOTIC)
+      return 0;
+   if(regime.atrRatio > InpHighVolAtrRatio)
+      return 2;
+   if(regime.atrRatio < 0.55)
+      return 2;
+   return 5;
+}
+
+int SpreadScore()
+{
+   double spread = SpreadPoints();
+   if(spread <= InpMaxSpreadPoints * 0.50)
+      return 5;
+   if(spread <= InpMaxSpreadPoints)
+      return 3;
+   return 0;
+}
+
+int SessionScore()
+{
+   if(!InpUseSessionScore)
+      return 5;
+   return IsInAllowedSession() ? 5 : 1;
+}
+
+//+------------------------------------------------------------------+
+//| Price action and strategy helpers                                 |
+//+------------------------------------------------------------------+
+SignalFeatures AnalyzeTriggerPriceAction(const Direction dir)
+{
+   SignalFeatures f;
+   f.sweep = false;
+   f.reclaim = false;
+   f.choch = false;
+   f.engulfing = false;
+   f.pinbar = false;
+   f.rejection = false;
+   f.score = 0;
+   f.tags = "";
+
+   double o1 = iOpen(TradeSymbol, InpTriggerTf, 1);
+   double c1 = iClose(TradeSymbol, InpTriggerTf, 1);
+   double h1 = iHigh(TradeSymbol, InpTriggerTf, 1);
+   double l1 = iLow(TradeSymbol, InpTriggerTf, 1);
+   double o2 = iOpen(TradeSymbol, InpTriggerTf, 2);
+   double c2 = iClose(TradeSymbol, InpTriggerTf, 2);
+   if(o1 == 0.0 || c1 == 0.0 || h1 == 0.0 || l1 == 0.0)
+      return f;
+
+   double body = MathMax(MathAbs(c1 - o1), PointValue());
+   double upperWick = h1 - MathMax(o1, c1);
+   double lowerWick = MathMin(o1, c1) - l1;
+
+   if(dir == DIR_BUY)
+   {
+      double priorLow = LowestLow(InpTriggerTf, 2, InpSweepLookback);
+      double priorHigh = HighestHigh(InpTriggerTf, 2, InpChochLookback);
+      f.sweep = (priorLow > 0.0 && l1 < priorLow);
+      f.reclaim = (priorLow > 0.0 && c1 > priorLow && c1 > o1);
+      f.choch = (priorHigh > 0.0 && c1 > priorHigh);
+      f.engulfing = (c1 > o1 && o1 <= c2 && c1 >= o2);
+      f.pinbar = (lowerWick >= body * 1.5 && lowerWick > upperWick);
+      f.rejection = (c1 > o1 && lowerWick >= body);
+   }
+   else if(dir == DIR_SELL)
+   {
+      double priorHigh = HighestHigh(InpTriggerTf, 2, InpSweepLookback);
+      double priorLow = LowestLow(InpTriggerTf, 2, InpChochLookback);
+      f.sweep = (priorHigh > 0.0 && h1 > priorHigh);
+      f.reclaim = (priorHigh > 0.0 && c1 < priorHigh && c1 < o1);
+      f.choch = (priorLow > 0.0 && c1 < priorLow);
+      f.engulfing = (c1 < o1 && o1 >= c2 && c1 <= o2);
+      f.pinbar = (upperWick >= body * 1.5 && upperWick > lowerWick);
+      f.rejection = (c1 < o1 && upperWick >= body);
+   }
+
+   if(f.sweep && f.reclaim) { f.score += 7; AppendTag(f.tags, "sweep_reclaim"); }
+   if(f.choch)             { f.score += 5; AppendTag(f.tags, "choch"); }
+   if(f.engulfing)         { f.score += 4; AppendTag(f.tags, "engulfing"); }
+   if(f.pinbar)            { f.score += 3; AppendTag(f.tags, "pinbar"); }
+   if(f.rejection)         { f.score += 2; AppendTag(f.tags, "rejection"); }
+
+   f.score = ClampInt(f.score, 0, 15);
+   if(f.tags == "")
+      f.tags = "basic";
+   return f;
+}
+
+bool FindActiveFvg(const Direction dir, double &zoneLow, double &zoneHigh)
+{
+   double price = CurrentEntryPrice(dir);
+   double atr = BufferValue(hAtrSetup, 0, 1);
+   double buffer = atr * InpZoneAtrBuffer;
+
+   for(int shift = 1; shift <= InpFvgLookback; ++shift)
+   {
+      double olderHigh = iHigh(TradeSymbol, InpSetupTf, shift + 2);
+      double olderLow = iLow(TradeSymbol, InpSetupTf, shift + 2);
+      double recentHigh = iHigh(TradeSymbol, InpSetupTf, shift);
+      double recentLow = iLow(TradeSymbol, InpSetupTf, shift);
+
+      if(dir == DIR_BUY && recentLow > olderHigh)
+      {
+         zoneLow = olderHigh;
+         zoneHigh = recentLow;
+         if(price >= zoneLow - buffer && price <= zoneHigh + buffer)
+            return true;
+      }
+      else if(dir == DIR_SELL && recentHigh < olderLow)
+      {
+         zoneLow = recentHigh;
+         zoneHigh = olderLow;
+         if(price >= zoneLow - buffer && price <= zoneHigh + buffer)
+            return true;
+      }
+   }
+
+   zoneLow = 0.0;
+   zoneHigh = 0.0;
+   return false;
+}
+
+bool NearSupportResistance(const Direction dir, const ENUM_TIMEFRAMES tf)
+{
+   double atr = BufferValue(hAtrSetup, 0, 1);
+   if(atr <= 0.0)
+      return false;
+
+   double price = CurrentEntryPrice(dir);
+   double recentHigh = HighestHigh(tf, 2, InpStructureLookback * 2);
+   double recentLow = LowestLow(tf, 2, InpStructureLookback * 2);
+   double buffer = atr * 0.45;
+
+   if(dir == DIR_BUY)
+      return MathAbs(price - recentLow) <= buffer;
+   if(dir == DIR_SELL)
+      return MathAbs(price - recentHigh) <= buffer;
+
+   return false;
+}
+
+bool IsPriceStretched(const Direction dir)
+{
+   double ema = BufferValue(hEmaFastSetup, 0, 1);
+   double atr = BufferValue(hAtrSetup, 0, 1);
+   if(atr <= 0.0)
+      return false;
+   double price = CurrentEntryPrice(dir);
+   return MathAbs(price - ema) / atr >= 1.0;
+}
+
+bool CompleteSignalPrices(TradeSignal &signal, const double invalidation)
+{
+   double entry = CurrentEntryPrice(signal.direction);
+   double atr = BufferValue(hAtrTrigger, 0, 1);
+   if(entry <= 0.0 || atr <= 0.0)
+      return false;
+
+   signal.idealEntry = entry;
+   signal.invalidation = invalidation;
+
+   double point = PointValue();
+   int stopLevel = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopDistance = MathMax(stopLevel * point, point * 5.0);
+
+   if(signal.direction == DIR_BUY)
+   {
+      signal.sl = invalidation - atr * InpAtrSlBuffer;
+      if(entry - signal.sl < minStopDistance)
+         signal.sl = entry - minStopDistance;
+   }
+   else if(signal.direction == DIR_SELL)
+   {
+      signal.sl = invalidation + atr * InpAtrSlBuffer;
+      if(signal.sl - entry < minStopDistance)
+         signal.sl = entry + minStopDistance;
+   }
+   else
+      return false;
+
+   double risk = MathAbs(entry - signal.sl);
+   if(risk <= minStopDistance * 0.50)
+      return false;
+
+   double target = 0.0;
+   if(!FindTargetPrice(signal.direction, entry, risk, target, signal.rr))
+      return false;
+
+   signal.tp = target;
+   signal.sl = NormalizeDouble(signal.sl, DigitsForSymbol());
+   signal.tp = NormalizeDouble(signal.tp, DigitsForSymbol());
+   return true;
+}
+
+bool FindTargetPrice(const Direction dir,
+                     const double entry,
+                     const double risk,
+                     double &target,
+                     double &rr)
+{
+   double structural = 0.0;
+   if(dir == DIR_BUY)
+      structural = HighestHigh(InpSetupTf, 2, InpTargetLookback);
+   else
+      structural = LowestLow(InpSetupTf, 2, InpTargetLookback);
+
+   bool hasRoom = false;
+   if(dir == DIR_BUY && structural > entry)
+   {
+      rr = (structural - entry) / risk;
+      hasRoom = rr >= InpMinExpectedRR;
+   }
+   else if(dir == DIR_SELL && structural < entry && structural > 0.0)
+   {
+      rr = (entry - structural) / risk;
+      hasRoom = rr >= InpMinExpectedRR;
+   }
+
+   if(hasRoom)
+   {
+      target = structural;
+      return true;
+   }
+
+   if(InpUseRoomToTargetFilter && InpSkipIfRoomTooSmall)
+      return false;
+
+   rr = InpDefaultRR;
+   target = (dir == DIR_BUY) ? entry + risk * InpDefaultRR
+                             : entry - risk * InpDefaultRR;
+   return target > 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| Data helpers                                                      |
+//+------------------------------------------------------------------+
+bool IndicatorsReady()
+{
+   int handles[13] =
+   {
+      hEmaFastContext, hEmaSlowContext, hEmaFastSetup, hEmaSlowSetup,
+      hEmaFastTrigger, hAtrContext, hAtrSetup, hAtrTrigger,
+      hAdxContext, hAdxSetup, hRsiTrigger, hBandsContext, hBandsSetup
+   };
+
+   for(int i = 0; i < ArraySize(handles); ++i)
+   {
+      if(handles[i] == INVALID_HANDLE)
+      {
+         Print("Indicator handle failed at index ", i);
+         return false;
+      }
+   }
+   return true;
+}
+
+bool MarketDataReady()
+{
+   MqlTick tick;
+   if(!SymbolInfoTick(TradeSymbol, tick))
+      return false;
+
+   int minBars = MathMax(InpEmaSlow + InpTargetLookback + 10, 120);
+   if(Bars(TradeSymbol, InpContextTf) < minBars ||
+      Bars(TradeSymbol, InpSetupTf) < minBars ||
+      Bars(TradeSymbol, InpTriggerTf) < minBars)
+      return false;
+
+   return true;
+}
+
+double BufferValue(const int handle, const int buffer, const int shift)
+{
+   if(handle == INVALID_HANDLE)
+      return 0.0;
+
+   double values[];
+   ArraySetAsSeries(values, true);
+   if(CopyBuffer(handle, buffer, shift, 1, values) <= 0)
+      return 0.0;
+   return values[0];
+}
+
+double AverageBuffer(const int handle, const int buffer, const int startShift, const int count)
+{
+   if(handle == INVALID_HANDLE || count <= 0)
+      return 0.0;
+
+   double values[];
+   ArraySetAsSeries(values, true);
+   int copied = CopyBuffer(handle, buffer, startShift, count, values);
+   if(copied <= 0)
+      return 0.0;
+
+   double sum = 0.0;
+   int usable = 0;
+   for(int i = 0; i < copied; ++i)
+   {
+      if(values[i] > 0.0)
+      {
+         sum += values[i];
+         usable++;
+      }
+   }
+
+   return usable > 0 ? sum / usable : 0.0;
+}
+
+double HighestHigh(const ENUM_TIMEFRAMES tf, const int startShift, const int count)
+{
+   double result = -1.0;
+   for(int i = startShift; i < startShift + count; ++i)
+   {
+      double v = iHigh(TradeSymbol, tf, i);
+      if(v > result)
+         result = v;
+   }
+   return result > 0.0 ? result : 0.0;
+}
+
+double LowestLow(const ENUM_TIMEFRAMES tf, const int startShift, const int count)
+{
+   double result = 1.0e100;
+   for(int i = startShift; i < startShift + count; ++i)
+   {
+      double v = iLow(TradeSymbol, tf, i);
+      if(v > 0.0 && v < result)
+         result = v;
+   }
+   return result < 1.0e99 ? result : 0.0;
+}
+
+double CurrentEntryPrice(const Direction dir)
+{
+   MqlTick tick;
+   if(!SymbolInfoTick(TradeSymbol, tick))
+      return 0.0;
+   if(dir == DIR_BUY)
+      return tick.ask;
+   if(dir == DIR_SELL)
+      return tick.bid;
+   return (tick.ask + tick.bid) * 0.5;
+}
+
+double SpreadPoints()
+{
+   MqlTick tick;
+   if(!SymbolInfoTick(TradeSymbol, tick))
+      return 999999.0;
+   return (tick.ask - tick.bid) / PointValue();
+}
+
+double PointValue()
+{
+   double p = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
+   return p > 0.0 ? p : _Point;
+}
+
+int DigitsForSymbol()
+{
+   return (int)SymbolInfoInteger(TradeSymbol, SYMBOL_DIGITS);
+}
+
+void ReleaseHandle(int &handle)
+{
+   if(handle != INVALID_HANDLE)
+   {
+      IndicatorRelease(handle);
+      handle = INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Account, volume, and history helpers                              |
+//+------------------------------------------------------------------+
+void UpdatePeakEquity()
+{
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity > g_peakEquity)
+   {
+      g_peakEquity = equity;
+      GlobalVariableSet(GvKey("PeakEquity"), g_peakEquity);
+   }
+}
+
+double CurrentDrawdownPct()
+{
+   if(g_peakEquity <= 0.0)
+      return 0.0;
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   return MathMax(0.0, (g_peakEquity - equity) / g_peakEquity * 100.0);
+}
+
+double MarginUsagePct()
+{
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double margin = AccountInfoDouble(ACCOUNT_MARGIN);
+   if(equity <= 0.0)
+      return 0.0;
+   return margin / equity * 100.0;
+}
+
+double MoneyRiskPerLot(const double stopDistance)
+{
+   double tickValue = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickValue <= 0.0 || tickSize <= 0.0 || stopDistance <= 0.0)
+      return 0.0;
+   return stopDistance / tickSize * tickValue;
+}
+
+double ScoreLotModifier(const int score)
+{
+   if(score <= 76) return 0.50;
+   if(score <= 82) return 0.75;
+   if(score <= 89) return 1.00;
+   return 1.10;
+}
+
+double DrawdownLotModifier()
+{
+   double dd = CurrentDrawdownPct();
+   if(dd < 3.0) return 1.00;
+   if(dd < 6.0) return 0.80;
+   if(dd < 10.0) return 0.50;
+   if(dd < 15.0) return 0.25;
+   return 0.0;
+}
+
+double VolatilityLotModifier()
+{
+   double atr = BufferValue(hAtrContext, 0, 1);
+   double atrAvg = AverageBuffer(hAtrContext, 0, 2, 50);
+   if(atr <= 0.0 || atrAvg <= 0.0)
+      return 1.0;
+   double ratio = atr / atrAvg;
+   if(ratio >= 2.20) return 0.40;
+   if(ratio >= 1.60) return 0.70;
+   if(ratio <= 0.60) return 0.85;
+   return 1.0;
+}
+
+double ExposureLotModifier()
+{
+   BasketInfo buyBasket;
+   BasketInfo sellBasket;
+   BuildBasket(DIR_BUY, buyBasket);
+   BuildBasket(DIR_SELL, sellBasket);
+   double exposure = buyBasket.lots + sellBasket.lots;
+   if(InpMaxTotalLot <= 0.0)
+      return 1.0;
+   double ratio = exposure / InpMaxTotalLot;
+   if(ratio >= 0.75) return 0.30;
+   if(ratio >= 0.50) return 0.60;
+   if(ratio >= 0.25) return 0.85;
+   return 1.0;
+}
+
+double NormalizeVolume(const double volume)
+{
+   double minLot = MathMax(MinBrokerLot(), InpMinLot);
+   double maxLot = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MAX);
+   double step = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0.0)
+      step = 0.01;
+
+   double v = MathMin(volume, maxLot);
+   v = MathFloor(v / step + 1.0e-8) * step;
+   v = NormalizeDouble(v, VolumeDigits(step));
+   if(v < minLot)
+      return 0.0;
+   return v;
+}
+
+double MinBrokerLot()
+{
+   double minLot = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MIN);
+   return minLot > 0.0 ? minLot : 0.01;
+}
+
+int VolumeDigits(const double step)
+{
+   if(step >= 1.0) return 0;
+   if(step >= 0.1) return 1;
+   if(step >= 0.01) return 2;
+   if(step >= 0.001) return 3;
+   return 4;
+}
+
+int TradesLastHour()
+{
+   datetime to = TimeCurrent();
+   datetime from = to - 3600;
+   if(!HistorySelect(from, to))
+      return 0;
+
+   int count = 0;
+   for(int i = HistoryDealsTotal() - 1; i >= 0; --i)
+   {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0)
+         continue;
+      if(HistoryDealGetString(deal, DEAL_SYMBOL) != TradeSymbol)
+         continue;
+      if(HistoryDealGetInteger(deal, DEAL_MAGIC) != (long)InpMagicNumber)
+         continue;
+      if(HistoryDealGetInteger(deal, DEAL_ENTRY) == DEAL_ENTRY_IN)
+         count++;
+   }
+   return count;
+}
+
+int ConsecutiveLosses()
+{
+   datetime to = TimeCurrent();
+   datetime from = to - 86400 * 30;
+   if(!HistorySelect(from, to))
+      return 0;
+
+   int losses = 0;
+   for(int i = HistoryDealsTotal() - 1; i >= 0; --i)
+   {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0)
+         continue;
+      if(HistoryDealGetString(deal, DEAL_SYMBOL) != TradeSymbol)
+         continue;
+      if(HistoryDealGetInteger(deal, DEAL_MAGIC) != (long)InpMagicNumber)
+         continue;
+
+      long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT)
+         continue;
+
+      double pnl = HistoryDealGetDouble(deal, DEAL_PROFIT)
+                 + HistoryDealGetDouble(deal, DEAL_SWAP)
+                 + HistoryDealGetDouble(deal, DEAL_COMMISSION);
+      if(pnl < 0.0)
+         losses++;
+      else if(pnl > 0.0)
+         break;
+   }
+   return losses;
+}
+
+//+------------------------------------------------------------------+
+//| Session and string helpers                                        |
+//+------------------------------------------------------------------+
+bool IsInAllowedSession()
+{
+   MqlDateTime t;
+   TimeToStruct(TimeGMT(), t);
+   int hour = t.hour;
+
+   bool anyConfigured = InpTradeAsian || InpTradeLondon || InpTradeNewYork ||
+                        (InpCustomSessionStartGmt >= 0 && InpCustomSessionEndGmt >= 0);
+   if(!anyConfigured)
+      return true;
+
+   bool allowed = false;
+   if(InpTradeAsian && hour >= 0 && hour < 8)
+      allowed = true;
+   if(InpTradeLondon && hour >= 7 && hour < 16)
+      allowed = true;
+   if(InpTradeNewYork && hour >= 12 && hour < 21)
+      allowed = true;
+   if(InpCustomSessionStartGmt >= 0 && InpCustomSessionEndGmt >= 0)
+      allowed = allowed || IsHourInRange(hour, InpCustomSessionStartGmt, InpCustomSessionEndGmt);
+
+   return allowed;
+}
+
+bool IsHourInRange(const int hour, const int startHour, const int endHour)
+{
+   int start = ((startHour % 24) + 24) % 24;
+   int end = ((endHour % 24) + 24) % 24;
+   if(start == end)
+      return true;
+   if(start < end)
+      return hour >= start && hour < end;
+   return hour >= start || hour < end;
+}
+
+bool IsStrongOpposite(const Direction dir, const MarketRegime regime)
+{
+   if(dir == DIR_BUY)
+      return regime == REGIME_STRONG_DOWNTREND || regime == REGIME_CHAOTIC;
+   if(dir == DIR_SELL)
+      return regime == REGIME_STRONG_UPTREND || regime == REGIME_CHAOTIC;
+   return true;
+}
+
+Direction OppositeDirection(const Direction dir)
+{
+   if(dir == DIR_BUY) return DIR_SELL;
+   if(dir == DIR_SELL) return DIR_BUY;
+   return DIR_NONE;
+}
+
+TradeSignal EmptySignal()
+{
+   TradeSignal s;
+   s.valid = false;
+   s.direction = DIR_NONE;
+   s.strategy = "";
+   s.score = 0;
+   s.idealEntry = 0.0;
+   s.sl = 0.0;
+   s.tp = 0.0;
+   s.invalidation = 0.0;
+   s.rr = 0.0;
+   s.reason = "";
+   return s;
+}
+
+int ClampInt(const int value, const int minValue, const int maxValue)
+{
+   return MathMax(minValue, MathMin(maxValue, value));
+}
+
+void AppendTag(string &target, const string tag)
+{
+   if(target == "")
+      target = tag;
+   else
+      target += "+" + tag;
+}
+
+string DirectionName(const Direction dir)
+{
+   if(dir == DIR_BUY) return "BUY";
+   if(dir == DIR_SELL) return "SELL";
+   return "NONE";
+}
+
+string RegimeName(const MarketRegime regime)
+{
+   switch(regime)
+   {
+      case REGIME_STRONG_UPTREND:   return "STRONG_UPTREND";
+      case REGIME_UPTREND:          return "UPTREND";
+      case REGIME_STRONG_DOWNTREND: return "STRONG_DOWNTREND";
+      case REGIME_DOWNTREND:        return "DOWNTREND";
+      case REGIME_RANGE:            return "RANGE";
+      case REGIME_COMPRESSION:      return "COMPRESSION";
+      case REGIME_BREAKOUT:         return "BREAKOUT";
+      case REGIME_HIGH_VOLATILITY:  return "HIGH_VOLATILITY";
+      case REGIME_CHAOTIC:          return "CHAOTIC";
+      default:                      return "UNKNOWN";
+   }
+}
+
+string StateName(const TradingState state)
+{
+   switch(state)
+   {
+      case STATE_RUNNING:       return "RUNNING";
+      case STATE_NO_NEW_ENTRY:  return "NO_NEW_ENTRY";
+      case STATE_RECOVERY_ONLY: return "RECOVERY_ONLY";
+      case STATE_CLOSE_ONLY:    return "CLOSE_ONLY";
+      case STATE_PAUSED:        return "PAUSED";
+      case STATE_EMERGENCY:     return "EMERGENCY";
+      default:                  return "UNKNOWN";
+   }
+}
+
+string ShortStrategyName(const string strategy)
+{
+   if(strategy == "TrendPullback") return "TPB";
+   if(strategy == "LiquiditySweep") return "SWP";
+   if(strategy == "FVGRetracement") return "FVG";
+   if(strategy == "BreakoutRetest") return "BOR";
+   return "SIG";
+}
+
+string GvKey(const string name)
+{
+   return "Lambo_" + TradeSymbol + "_" + IntegerToString((long)InpMagicNumber) + "_" + name;
+}
+
+//+------------------------------------------------------------------+
+//| Journal                                                           |
+//+------------------------------------------------------------------+
+void InitJournal()
+{
+   if(!InpWriteJournal)
+      return;
+
+   int handle = FileOpen(InpJournalFileName,
+                         FILE_READ | FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+   {
+      Print("Cannot open journal file: ", InpJournalFileName, " error=", GetLastError());
+      return;
+   }
+
+   if(FileSize(handle) == 0)
+   {
+      FileWrite(handle, "timestamp", "action", "symbol", "direction", "strategy",
+                "context", "score", "entry", "sl", "tp", "lot", "rr",
+                "spread_points", "pnl_or_code", "equity", "drawdown_pct", "reason");
+   }
+   FileClose(handle);
+}
+
+void WriteJournal(const string action,
+                  const string direction,
+                  const string strategy,
+                  const string context,
+                  const int score,
+                  const double entry,
+                  const double sl,
+                  const double tp,
+                  const double lot,
+                  const double rr,
+                  const double spread,
+                  const double pnlOrCode,
+                  const string reason)
+{
+   if(!InpWriteJournal)
+      return;
+
+   int handle = FileOpen(InpJournalFileName,
+                         FILE_READ | FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+      return;
+
+   FileSeek(handle, 0, SEEK_END);
+   FileWrite(handle,
+             TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS),
+             action,
+             TradeSymbol,
+             direction,
+             strategy,
+             context,
+             score,
+             DoubleToString(entry, DigitsForSymbol()),
+             DoubleToString(sl, DigitsForSymbol()),
+             DoubleToString(tp, DigitsForSymbol()),
+             DoubleToString(lot, 2),
+             DoubleToString(rr, 2),
+             DoubleToString(spread, 1),
+             DoubleToString(pnlOrCode, 2),
+             DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
+             DoubleToString(CurrentDrawdownPct(), 2),
+             reason);
+   FileClose(handle);
+}

@@ -1,0 +1,6 @@
+*.ex5
+*.log
+*.opt
+*.set
+*.csv
+!.gitkeep
