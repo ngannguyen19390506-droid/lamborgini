@@ -21,7 +21,7 @@ docs/journal-analysis.md        Cách đọc MAE/MFE và candidate/reject theo n
 4. Gắn EA vào chart XAUUSD, ưu tiên chart M2.
 5. Bật `Algo Trading`.
 
-Nếu broker dùng tên khác như `XAUUSDm`, đổi tham số `InpTradeSymbol`.
+Mặc định `InpTradeSymbol` để trống, EA sẽ dùng đúng symbol đang chạy trong chart/Strategy Tester. Nếu broker dùng tên khác như `XAUUSDm` hoặc `XAUUSD_m`, chỉ cần chọn đúng symbol đó trong Strategy Tester; không cần sửa input.
 
 ## Logic v1
 

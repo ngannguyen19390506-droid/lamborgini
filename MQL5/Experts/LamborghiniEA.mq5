@@ -118,7 +118,7 @@ struct TradeSignal
 };
 
 input group "Core"
-input string          InpTradeSymbol              = "XAUUSD";
+input string          InpTradeSymbol              = "";
 input ulong           InpMagicNumber              = 19390506;
 input ENUM_TIMEFRAMES InpContextTf                = PERIOD_M15;
 input ENUM_TIMEFRAMES InpSetupTf                  = PERIOD_M5;
@@ -272,15 +272,39 @@ datetime g_lastSellEntryBar = 0;
 double g_peakEquity = 0.0;
 string g_activeAnalysisDate = "";
 
+string ResolveTradeSymbol()
+{
+   if(InpTradeSymbol == "")
+   {
+      if(SymbolSelect(_Symbol, true))
+         return _Symbol;
+      return "";
+   }
+
+   if(SymbolSelect(InpTradeSymbol, true))
+      return InpTradeSymbol;
+
+   if(_Symbol != "" && StringFind(_Symbol, InpTradeSymbol) == 0 &&
+      SymbolSelect(_Symbol, true))
+   {
+      Print("Input symbol ", InpTradeSymbol, " not found. Using tester/chart symbol ",
+            _Symbol, " instead.");
+      return _Symbol;
+   }
+
+   return "";
+}
+
 //+------------------------------------------------------------------+
 //| Expert initialization                                             |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   TradeSymbol = (InpTradeSymbol == "" ? _Symbol : InpTradeSymbol);
-   if(!SymbolSelect(TradeSymbol, true))
+   TradeSymbol = ResolveTradeSymbol();
+   if(TradeSymbol == "")
    {
-      Print("Cannot select symbol: ", TradeSymbol);
+      Print("Cannot select trade symbol. Input=", InpTradeSymbol,
+            ", tester/chart symbol=", _Symbol);
       return INIT_FAILED;
    }
 
