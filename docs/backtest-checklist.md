@@ -58,6 +58,15 @@ Chạy `InpLotMode = LOT_FIXED` và lot nhỏ để đánh giá:
 
 Sau đó mới chuyển sang `LOT_SMART`.
 
+Với `MODE_TREND_BASKET`, test riêng trước:
+
+- `InpStrategyMode = MODE_TREND_BASKET`
+- `InpTrendTf = H1`
+- `InpLotMode = LOT_FIXED`
+- `InpMaxPositionsPerBasket = 2-3`
+- xem `EXIT` có cải thiện winrate/PF không trước khi tăng DCA hoặc lot
+- nếu ít lệnh, nới `InpTrendBasketMinAdx`, `InpTrendBasketMaxChaseAtr`, hoặc `InpTrendBasketMinPaScore` từng bước nhỏ
+
 ## 3. Optimize thô
 
 Optimize theo cụm nhỏ, tránh overfit:

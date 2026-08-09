@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Lamborghini EA"
 #property link      "https://github.com/ngannguyen19390506-droid/lamborgini"
-#property version   "1.04"
+#property version   "1.05"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -53,6 +53,12 @@ enum EntryExecution
    EXEC_MARKET = 0,
    EXEC_LIMIT,
    EXEC_STOP
+};
+
+enum StrategyMode
+{
+   MODE_HYBRID_SCORING = 0,
+   MODE_TREND_BASKET
 };
 
 struct RegimeInfo
@@ -123,6 +129,7 @@ input ulong           InpMagicNumber              = 19390506;
 input ENUM_TIMEFRAMES InpContextTf                = PERIOD_M15;
 input ENUM_TIMEFRAMES InpSetupTf                  = PERIOD_M5;
 input ENUM_TIMEFRAMES InpTriggerTf                = PERIOD_M2;
+input StrategyMode    InpStrategyMode             = MODE_HYBRID_SCORING;
 input TradingState    InpManualState              = STATE_RUNNING;
 input bool            InpAllowHedgedBaskets       = true;
 input bool            InpOneEntryPerM2Bar         = true;
@@ -152,6 +159,22 @@ input bool            InpEnableTrendPullback      = true;
 input bool            InpEnableLiquiditySweep     = true;
 input bool            InpEnableFvgRetracement     = true;
 input bool            InpEnableBreakoutRetest     = true;
+
+input group "Trend Basket Mode"
+input ENUM_TIMEFRAMES InpTrendTf                  = PERIOD_H1;
+input double          InpTrendBasketMinAdx        = 18.0;
+input double          InpTrendBasketMinGapAtr     = 0.10;
+input double          InpTrendBasketMinSlopeAtr   = 0.02;
+input double          InpTrendBasketPullbackAtr   = 0.70;
+input double          InpTrendBasketMaxChaseAtr   = 0.75;
+input int             InpTrendBasketMinPaScore    = 4;
+input int             InpTrendBasketMinEntryScore = 68;
+input int             InpTrendBasketMinAddScore   = 72;
+input int             InpTrendBasketAddScoreStep  = 2;
+input bool            InpTrendBasketCloseOnFlip   = true;
+input bool            InpUseBasketProtectiveStops = true;
+input double          InpBasketBreakEvenBufferPoints = 60.0;
+input double          InpTrendBasketTrailAtrBuffer= 0.35;
 
 input group "Indicators"
 input int             InpEmaFast                  = 21;
@@ -264,12 +287,16 @@ string TradeSymbol = "";
 
 int hEmaFastContext = INVALID_HANDLE;
 int hEmaSlowContext = INVALID_HANDLE;
+int hEmaFastTrend   = INVALID_HANDLE;
+int hEmaSlowTrend   = INVALID_HANDLE;
 int hEmaFastSetup   = INVALID_HANDLE;
 int hEmaSlowSetup   = INVALID_HANDLE;
 int hEmaFastTrigger = INVALID_HANDLE;
+int hAtrTrend       = INVALID_HANDLE;
 int hAtrContext     = INVALID_HANDLE;
 int hAtrSetup       = INVALID_HANDLE;
 int hAtrTrigger     = INVALID_HANDLE;
+int hAdxTrend       = INVALID_HANDLE;
 int hAdxContext     = INVALID_HANDLE;
 int hAdxSetup       = INVALID_HANDLE;
 int hRsiTrigger     = INVALID_HANDLE;
@@ -320,12 +347,16 @@ int OnInit()
 
    hEmaFastContext = iMA(TradeSymbol, InpContextTf, InpEmaFast, 0, MODE_EMA, PRICE_CLOSE);
    hEmaSlowContext = iMA(TradeSymbol, InpContextTf, InpEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
+   hEmaFastTrend   = iMA(TradeSymbol, InpTrendTf,   InpEmaFast, 0, MODE_EMA, PRICE_CLOSE);
+   hEmaSlowTrend   = iMA(TradeSymbol, InpTrendTf,   InpEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
    hEmaFastSetup   = iMA(TradeSymbol, InpSetupTf,   InpEmaFast, 0, MODE_EMA, PRICE_CLOSE);
    hEmaSlowSetup   = iMA(TradeSymbol, InpSetupTf,   InpEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
    hEmaFastTrigger = iMA(TradeSymbol, InpTriggerTf, InpEmaFast, 0, MODE_EMA, PRICE_CLOSE);
+   hAtrTrend       = iATR(TradeSymbol, InpTrendTf, InpAtrPeriod);
    hAtrContext     = iATR(TradeSymbol, InpContextTf, InpAtrPeriod);
    hAtrSetup       = iATR(TradeSymbol, InpSetupTf,   InpAtrPeriod);
    hAtrTrigger     = iATR(TradeSymbol, InpTriggerTf, InpAtrPeriod);
+   hAdxTrend       = iADX(TradeSymbol, InpTrendTf, InpAdxPeriod);
    hAdxContext     = iADX(TradeSymbol, InpContextTf, InpAdxPeriod);
    hAdxSetup       = iADX(TradeSymbol, InpSetupTf,   InpAdxPeriod);
    hRsiTrigger     = iRSI(TradeSymbol, InpTriggerTf, InpRsiPeriod, PRICE_CLOSE);
@@ -365,12 +396,16 @@ void OnDeinit(const int reason)
 
    ReleaseHandle(hEmaFastContext);
    ReleaseHandle(hEmaSlowContext);
+   ReleaseHandle(hEmaFastTrend);
+   ReleaseHandle(hEmaSlowTrend);
    ReleaseHandle(hEmaFastSetup);
    ReleaseHandle(hEmaSlowSetup);
    ReleaseHandle(hEmaFastTrigger);
+   ReleaseHandle(hAtrTrend);
    ReleaseHandle(hAtrContext);
    ReleaseHandle(hAtrSetup);
    ReleaseHandle(hAtrTrigger);
+   ReleaseHandle(hAdxTrend);
    ReleaseHandle(hAdxContext);
    ReleaseHandle(hAdxSetup);
    ReleaseHandle(hRsiTrigger);
@@ -413,6 +448,12 @@ void OnTick()
       return;
 
    g_lastSignalBar = currentM2Bar;
+
+   if(InpStrategyMode == MODE_TREND_BASKET)
+   {
+      HandleTrendBasketMode(regime, buyBasket, sellBasket, state);
+      return;
+   }
 
    TradeSignal best = FindBestSignal(regime);
    if(!best.valid)
@@ -471,6 +512,242 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
    if(!PositionIdStillOpen(positionId))
       DeletePositionExcursions(positionId);
+}
+
+//+------------------------------------------------------------------+
+//| Trend basket mode                                                 |
+//+------------------------------------------------------------------+
+void HandleTrendBasketMode(const RegimeInfo &regime,
+                           const BasketInfo &buyBasket,
+                           const BasketInfo &sellBasket,
+                           const TradingState state)
+{
+   Direction trendDir = TrendBasketDirection(regime);
+   if(trendDir == DIR_NONE)
+      return;
+
+   Direction oppositeDir = OppositeDirection(trendDir);
+   BasketInfo sameBasket = (trendDir == DIR_BUY ? buyBasket : sellBasket);
+   BasketInfo oppositeBasket = (trendDir == DIR_BUY ? sellBasket : buyBasket);
+
+   if(InpTrendBasketCloseOnFlip && oppositeBasket.count > 0)
+   {
+      CloseBasket(oppositeDir, "TREND_BASKET_FLIP_" + DirectionName(trendDir));
+      CancelPendingOrders(oppositeDir, "trend_basket_flip");
+      return;
+   }
+
+   CancelPendingOrders(oppositeDir, "trend_basket_one_way");
+
+   TradeSignal signal = DetectTrendBasketSignal(trendDir, regime, sameBasket);
+   if(!signal.valid)
+      return;
+
+   if(InpWriteCandidateEvents)
+   {
+      WriteJournal("CANDIDATE", DirectionName(signal.direction), signal.strategy,
+                   regime.label, signal.score, signal.idealEntry, signal.sl, signal.tp,
+                   0.0, signal.rr, SpreadPoints(), 0.0, signal.reason,
+                   ExecutionName(signal.execution), signal.orderPrice);
+   }
+
+   TryOpenSignal(signal, state);
+}
+
+Direction TrendBasketDirection(const RegimeInfo &regime)
+{
+   string buyReason = "";
+   string sellReason = "";
+   bool buyOk = TrendBasketTrendOk(DIR_BUY, regime, buyReason);
+   bool sellOk = TrendBasketTrendOk(DIR_SELL, regime, sellReason);
+
+   if(buyOk && !sellOk)
+      return DIR_BUY;
+   if(sellOk && !buyOk)
+      return DIR_SELL;
+   if(!buyOk && !sellOk)
+      return DIR_NONE;
+
+   double buyStrength = TrendBasketTrendStrength(DIR_BUY);
+   double sellStrength = TrendBasketTrendStrength(DIR_SELL);
+   if(buyStrength > sellStrength)
+      return DIR_BUY;
+   if(sellStrength > buyStrength)
+      return DIR_SELL;
+   return DIR_NONE;
+}
+
+bool TrendBasketTrendOk(const Direction dir,
+                        const RegimeInfo &regime,
+                        string &reason)
+{
+   double fast = BufferValue(hEmaFastTrend, 0, 1);
+   double slow = BufferValue(hEmaSlowTrend, 0, 1);
+   double fast4 = BufferValue(hEmaFastTrend, 0, 4);
+   double atr = BufferValue(hAtrTrend, 0, 1);
+   double adx = BufferValue(hAdxTrend, 0, 1);
+   if(fast <= 0.0 || slow <= 0.0 || atr <= 0.0)
+      return false;
+
+   double gapAtr = (fast - slow) / atr;
+   double slopeAtr = (fast - fast4) / atr;
+   bool trend = false;
+   if(dir == DIR_BUY)
+      trend = gapAtr >= InpTrendBasketMinGapAtr && slopeAtr >= InpTrendBasketMinSlopeAtr;
+   else if(dir == DIR_SELL)
+      trend = gapAtr <= -InpTrendBasketMinGapAtr && slopeAtr <= -InpTrendBasketMinSlopeAtr;
+
+   bool contextOk = !IsStrongOpposite(dir, regime.regime) &&
+                    DirectionContextScore(dir, regime.regime, "TrendBasket") >= 8;
+   bool adxOk = adx >= InpTrendBasketMinAdx;
+
+   reason = StringFormat("trendTf=%s; gapAtr=%.2f; slopeAtr=%.2f; adx=%.1f; context=%s",
+                         EnumToString(InpTrendTf), gapAtr, slopeAtr, adx, regime.label);
+   return trend && adxOk && contextOk;
+}
+
+double TrendBasketTrendStrength(const Direction dir)
+{
+   double fast = BufferValue(hEmaFastTrend, 0, 1);
+   double slow = BufferValue(hEmaSlowTrend, 0, 1);
+   double fast4 = BufferValue(hEmaFastTrend, 0, 4);
+   double atr = BufferValue(hAtrTrend, 0, 1);
+   double adx = BufferValue(hAdxTrend, 0, 1);
+   if(atr <= 0.0)
+      return 0.0;
+
+   double gapAtr = (fast - slow) / atr;
+   double slopeAtr = (fast - fast4) / atr;
+   if(dir == DIR_BUY)
+      return MathMax(0.0, gapAtr) + MathMax(0.0, slopeAtr) + adx / 100.0;
+   if(dir == DIR_SELL)
+      return MathMax(0.0, -gapAtr) + MathMax(0.0, -slopeAtr) + adx / 100.0;
+   return 0.0;
+}
+
+TradeSignal DetectTrendBasketSignal(const Direction dir,
+                                    const RegimeInfo &regime,
+                                    const BasketInfo &basket)
+{
+   TradeSignal s = EmptySignal();
+   s.direction = dir;
+   s.strategy = "TrendBasket";
+   s.execution = EXEC_MARKET;
+
+   string trendReason = "";
+   if(!TrendBasketTrendOk(dir, regime, trendReason))
+      return s;
+
+   double emaFast = BufferValue(hEmaFastSetup, 0, 1);
+   double emaSlow = BufferValue(hEmaSlowSetup, 0, 1);
+   double atr = BufferValue(hAtrSetup, 0, 1);
+   if(emaFast <= 0.0 || emaSlow <= 0.0 || atr <= 0.0)
+      return s;
+
+   double price = CurrentEntryPrice(dir);
+   double close1 = iClose(TradeSymbol, InpSetupTf, 1);
+   double high1 = iHigh(TradeSymbol, InpSetupTf, 1);
+   double low1 = iLow(TradeSymbol, InpSetupTf, 1);
+   if(price <= 0.0 || close1 <= 0.0 || high1 <= 0.0 || low1 <= 0.0)
+      return s;
+
+   bool setupTrend = (dir == DIR_BUY ? emaFast >= emaSlow : emaFast <= emaSlow);
+   bool pullback = false;
+   bool notChasing = false;
+   if(dir == DIR_BUY)
+   {
+      pullback = low1 <= emaFast + atr * InpTrendBasketPullbackAtr &&
+                 close1 >= emaFast - atr * 0.15;
+      notChasing = price <= emaFast + atr * InpTrendBasketMaxChaseAtr &&
+                   price >= emaSlow - atr * 0.25;
+   }
+   else if(dir == DIR_SELL)
+   {
+      pullback = high1 >= emaFast - atr * InpTrendBasketPullbackAtr &&
+                 close1 <= emaFast + atr * 0.15;
+      notChasing = price >= emaFast - atr * InpTrendBasketMaxChaseAtr &&
+                   price <= emaSlow + atr * 0.25;
+   }
+
+   if(!setupTrend || !pullback || !notChasing)
+      return s;
+
+   SignalFeatures pa = AnalyzeTriggerPriceAction(dir);
+   if(pa.score < InpTrendBasketMinPaScore)
+      return s;
+
+   s.contextScore = TrendBasketContextScore(dir, regime);
+   s.structureScore = StructureScore(dir, InpSetupTf);
+   s.setupScore = 15;
+   s.locationScore = TrendBasketLocationScore(dir, emaFast, emaSlow, atr);
+   s.paScore = ClampInt(pa.score, 0, 15);
+   s.momentumScore = MomentumScore(dir);
+   s.volatilityScore = VolatilityScore(regime);
+   s.spreadScore = SpreadScore();
+   s.sessionScore = SessionScore();
+   if(basket.count > 0)
+      s.setupScore = MathMax(10, s.setupScore - basket.count);
+
+   s.score = ClampInt(s.contextScore + s.structureScore + s.setupScore +
+                      s.locationScore + s.paScore + s.momentumScore +
+                      s.volatilityScore + s.spreadScore + s.sessionScore, 0, 100);
+
+   double invalidation = 0.0;
+   double swing = 0.0;
+   if(dir == DIR_BUY)
+   {
+      swing = LowestLow(InpSetupTf, 2, InpStructureLookback);
+      if(swing <= 0.0)
+         return s;
+      invalidation = MathMin(swing, emaSlow);
+   }
+   else
+   {
+      swing = HighestHigh(InpSetupTf, 2, InpStructureLookback);
+      if(swing <= 0.0)
+         return s;
+      invalidation = MathMax(swing, emaSlow);
+   }
+
+   if(!CompleteSignalPrices(s, invalidation, price))
+      return EmptySignal();
+
+   s.reason = StringFormat("%s; basket_count=%d; pullback=true; chase_ok=true; pa=%s; %s",
+                           trendReason, basket.count, pa.tags, ScoreBreakdown(s));
+   s.valid = true;
+   return s;
+}
+
+int TrendBasketContextScore(const Direction dir, const RegimeInfo &regime)
+{
+   int score = DirectionContextScore(dir, regime.regime, "TrendBasket");
+   double strength = TrendBasketTrendStrength(dir);
+   if(strength >= 0.80)
+      score = MathMax(score, 15);
+   else if(strength >= 0.45)
+      score = MathMax(score, 13);
+   return ClampInt(score, 0, 15);
+}
+
+int TrendBasketLocationScore(const Direction dir,
+                             const double emaFast,
+                             const double emaSlow,
+                             const double atr)
+{
+   double price = CurrentEntryPrice(dir);
+   if(price <= 0.0 || atr <= 0.0)
+      return 0;
+
+   double distanceFast = MathAbs(price - emaFast) / atr;
+   double distanceSlow = MathAbs(price - emaSlow) / atr;
+   int score = 8;
+   if(distanceFast <= 0.30)
+      score += 5;
+   else if(distanceFast <= 0.60)
+      score += 3;
+   if(distanceSlow <= 0.90)
+      score += 2;
+   return ClampInt(score, 0, 15);
 }
 
 //+------------------------------------------------------------------+
@@ -1074,6 +1351,18 @@ int RequiredScoreFor(const TradeSignal &signal,
                      const bool isRecovery,
                      const bool isPyramid)
 {
+   if(signal.strategy == "TrendBasket")
+   {
+      int requiredTrendScore = (basket.count <= 0 ? InpTrendBasketMinEntryScore :
+                               InpTrendBasketMinAddScore +
+                               MathMax(0, basket.count - 1) * InpTrendBasketAddScoreStep);
+      if(signal.contextScore <= 8)
+         requiredTrendScore += InpWeakContextPenalty;
+      if(signal.volatilityScore <= 2)
+         requiredTrendScore += InpHighVolatilityPenalty;
+      return ClampInt(requiredTrendScore, InpMinAdaptiveEntryScore, 95);
+   }
+
    int required = InpMinEntryScore;
 
    if(basket.count <= 0)
@@ -1230,6 +1519,12 @@ void ManageBaskets(const RegimeInfo &regime,
       ManageBasketTrailing(DIR_SELL, sellBasket);
    }
 
+   if(InpUseBasketProtectiveStops)
+   {
+      ManageBasketProtectiveStops(DIR_BUY, buyBasket);
+      ManageBasketProtectiveStops(DIR_SELL, sellBasket);
+   }
+
    if(InpCloseInvalidatedBasket)
    {
       if(buyBasket.count > 0 && buyBasket.floating < 0.0 && IsBasketInvalidated(DIR_BUY, regime))
@@ -1298,6 +1593,39 @@ void ManagePendingOrders(const RegimeInfo &regime)
    }
 }
 
+void CancelPendingOrders(const Direction dir, const string reason)
+{
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(OrderGetString(ORDER_SYMBOL) != TradeSymbol)
+         continue;
+      if(OrderGetInteger(ORDER_MAGIC) != (long)InpMagicNumber)
+         continue;
+
+      ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(!IsPendingOrderType(type))
+         continue;
+
+      Direction orderDir = PendingOrderDirection(type);
+      if(dir != DIR_NONE && orderDir != dir)
+         continue;
+
+      double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+      double volume = OrderGetDouble(ORDER_VOLUME_CURRENT);
+      ResetLastError();
+      bool deleted = Trade.OrderDelete(ticket);
+      WriteJournal(deleted ? "CANCEL_PENDING" : "CANCEL_PENDING_FAILED",
+                   DirectionName(orderDir), "", "", 0,
+                   CurrentEntryPrice(orderDir), 0.0, 0.0, volume, 0.0, SpreadPoints(),
+                   (double)Trade.ResultRetcode(), reason,
+                   PendingTypeName(type), orderPrice);
+   }
+}
+
 void ManageBasketTrailing(const Direction dir, const BasketInfo &basket)
 {
    string activeKey = GvKey(DirectionName(dir) + "_TrailActive");
@@ -1333,6 +1661,84 @@ void ManageBasketTrailing(const Direction dir, const BasketInfo &basket)
 
       if(basket.floating <= protectedProfit)
          CloseBasket(dir, "BASKET_TRAILING");
+   }
+}
+
+void ManageBasketProtectiveStops(const Direction dir, const BasketInfo &basket)
+{
+   if(basket.count <= 0 || basket.lots <= 0.0)
+      return;
+   if(basket.floating < InpBasketTrailStartMoney)
+      return;
+
+   MqlTick tick;
+   if(!SymbolInfoTick(TradeSymbol, tick))
+      return;
+
+   double point = PointValue();
+   double minStopDistance = MathMax((int)SymbolInfoInteger(TradeSymbol, SYMBOL_TRADE_STOPS_LEVEL) * point,
+                                    point * 5.0);
+   double desiredSl = 0.0;
+   double beBuffer = InpBasketBreakEvenBufferPoints * point;
+
+   if(dir == DIR_BUY)
+      desiredSl = basket.avgPrice + beBuffer;
+   else if(dir == DIR_SELL)
+      desiredSl = basket.avgPrice - beBuffer;
+   else
+      return;
+
+   if(InpStrategyMode == MODE_TREND_BASKET)
+   {
+      double emaFast = BufferValue(hEmaFastSetup, 0, 1);
+      double atr = BufferValue(hAtrSetup, 0, 1);
+      if(emaFast > 0.0 && atr > 0.0)
+      {
+         double trailSl = (dir == DIR_BUY ?
+                           emaFast - atr * InpTrendBasketTrailAtrBuffer :
+                           emaFast + atr * InpTrendBasketTrailAtrBuffer);
+         if(dir == DIR_BUY)
+            desiredSl = MathMax(desiredSl, trailSl);
+         else
+            desiredSl = MathMin(desiredSl, trailSl);
+      }
+   }
+
+   if(dir == DIR_BUY)
+      desiredSl = MathMin(desiredSl, tick.bid - minStopDistance);
+   else
+      desiredSl = MathMax(desiredSl, tick.ask + minStopDistance);
+
+   desiredSl = NormalizePrice(desiredSl);
+   if(desiredSl <= 0.0)
+      return;
+
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != TradeSymbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber)
+         continue;
+
+      long type = PositionGetInteger(POSITION_TYPE);
+      Direction posDir = (type == POSITION_TYPE_BUY ? DIR_BUY : DIR_SELL);
+      if(posDir != dir)
+         continue;
+
+      double currentSl = PositionGetDouble(POSITION_SL);
+      double currentTp = PositionGetDouble(POSITION_TP);
+      bool improve = false;
+      if(dir == DIR_BUY)
+         improve = (currentSl <= 0.0 || desiredSl > currentSl + point);
+      else
+         improve = (currentSl <= 0.0 || desiredSl < currentSl - point);
+
+      if(improve)
+         Trade.PositionModify(ticket, desiredSl, currentTp);
    }
 }
 
@@ -2176,11 +2582,13 @@ bool FindTargetPrice(const Direction dir,
 //+------------------------------------------------------------------+
 bool IndicatorsReady()
 {
-   int handles[13] =
+   int handles[17] =
    {
-      hEmaFastContext, hEmaSlowContext, hEmaFastSetup, hEmaSlowSetup,
-      hEmaFastTrigger, hAtrContext, hAtrSetup, hAtrTrigger,
-      hAdxContext, hAdxSetup, hRsiTrigger, hBandsContext, hBandsSetup
+      hEmaFastContext, hEmaSlowContext, hEmaFastTrend, hEmaSlowTrend,
+      hEmaFastSetup, hEmaSlowSetup, hEmaFastTrigger,
+      hAtrTrend, hAtrContext, hAtrSetup, hAtrTrigger,
+      hAdxTrend, hAdxContext, hAdxSetup, hRsiTrigger,
+      hBandsContext, hBandsSetup
    };
 
    for(int i = 0; i < ArraySize(handles); ++i)
@@ -2201,7 +2609,8 @@ bool MarketDataReady()
       return false;
 
    int minBars = MathMax(InpEmaSlow + InpTargetLookback + 10, 120);
-   if(Bars(TradeSymbol, InpContextTf) < minBars ||
+   if(Bars(TradeSymbol, InpTrendTf) < minBars ||
+      Bars(TradeSymbol, InpContextTf) < minBars ||
       Bars(TradeSymbol, InpSetupTf) < minBars ||
       Bars(TradeSymbol, InpTriggerTf) < minBars)
       return false;
@@ -2758,10 +3167,12 @@ string PendingTypeName(const ENUM_ORDER_TYPE type)
 
 string ShortStrategyName(const string strategy)
 {
+   if(strategy == "TBK") return "TBK";
    if(strategy == "TPB") return "TPB";
    if(strategy == "SWP") return "SWP";
    if(strategy == "FVG") return "FVG";
    if(strategy == "BOR") return "BOR";
+   if(strategy == "TrendBasket") return "TBK";
    if(strategy == "TrendPullback") return "TPB";
    if(strategy == "LiquiditySweep") return "SWP";
    if(strategy == "FVGRetracement") return "FVG";
@@ -2788,6 +3199,7 @@ string DealStrategyCode(const ulong deal)
 
 int StrategyIdFromCode(const string code)
 {
+   if(code == "TBK") return 5;
    if(code == "TPB") return 1;
    if(code == "SWP") return 2;
    if(code == "FVG") return 3;
@@ -2797,6 +3209,7 @@ int StrategyIdFromCode(const string code)
 
 string StrategyCodeFromId(const int strategyId)
 {
+   if(strategyId == 5) return "TBK";
    if(strategyId == 1) return "TPB";
    if(strategyId == 2) return "SWP";
    if(strategyId == 3) return "FVG";
@@ -3085,7 +3498,7 @@ void FlushDailySummary(const string date, const string source)
       return;
 
    string actionCodes[7] = {"CAN", "REJ", "ENT", "FAIL", "EXT", "CLS", "CNP"};
-   string strategyCodes[6] = {"TPB", "SWP", "FVG", "BOR", "SIG", "NA"};
+   string strategyCodes[7] = {"TBK", "TPB", "SWP", "FVG", "BOR", "SIG", "NA"};
 
    FileSeek(handle, 0, SEEK_END);
    for(int a = 0; a < ArraySize(actionCodes); ++a)
@@ -3126,7 +3539,7 @@ void FlushDailySummary(const string date, const string source)
 void ClearDailyCounters(const string date)
 {
    string actionCodes[7] = {"CAN", "REJ", "ENT", "FAIL", "EXT", "CLS", "CNP"};
-   string strategyCodes[6] = {"TPB", "SWP", "FVG", "BOR", "SIG", "NA"};
+   string strategyCodes[7] = {"TBK", "TPB", "SWP", "FVG", "BOR", "SIG", "NA"};
    string metrics[7] = {"C", "SS", "SC", "PNL", "MAE", "MFE", "EXC"};
 
    for(int a = 0; a < ArraySize(actionCodes); ++a)

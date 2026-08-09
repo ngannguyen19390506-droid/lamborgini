@@ -25,7 +25,12 @@ Mặc định `InpTradeSymbol` để trống, EA sẽ dùng đúng symbol đang 
 
 ## Logic v1
 
-EA tìm tín hiệu bằng 4 strategy độc lập:
+EA có 2 mode chính qua `InpStrategyMode`:
+
+- `MODE_HYBRID_SCORING`: mode cũ, tìm tín hiệu bằng nhiều setup độc lập.
+- `MODE_TREND_BASKET`: mode mới, chỉ giao dịch một chiều theo trend lớn, add lệnh cùng chiều có kiểm soát, bảo vệ SL theo basket và đóng basket khi trend đảo.
+
+Trong `MODE_HYBRID_SCORING`, EA tìm tín hiệu bằng 4 strategy độc lập:
 
 - `TrendPullback`: trend/context đúng, M5 pullback vào EMA/location, M2 xác nhận.
 - `LiquiditySweep`: sweep previous high/low, reclaim, CHoCH/rejection.
@@ -33,6 +38,8 @@ EA tìm tín hiệu bằng 4 strategy độc lập:
 - `BreakoutRetest`: dùng trong range/compression, breakout rồi retest.
 
 Từng strategy có input bật/tắt riêng: `InpEnableTrendPullback`, `InpEnableLiquiditySweep`, `InpEnableFvgRetracement`, `InpEnableBreakoutRetest`. Dùng các toggle này để test core strategy trước khi bật full hybrid.
+
+Trong `MODE_TREND_BASKET`, EA dùng `InpTrendTf` mặc định H1 để xác định hướng chính. M15 không được ngược mạnh, M5 phải pullback về EMA zone, M2 cần xác nhận price action. Nếu có basket ngược chiều khi trend flip, EA đóng basket/pending ngược rồi chờ nến sau để vào lại đúng chiều. Khi basket có lãi đủ, `InpUseBasketProtectiveStops` sẽ kéo SL từng position về vùng BE + buffer và trail theo EMA/ATR.
 
 Mỗi candidate được chấm 0-100 theo:
 
