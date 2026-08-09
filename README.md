@@ -32,6 +32,8 @@ EA tìm tín hiệu bằng 4 strategy độc lập:
 - `FVGRetracement`: giá quay lại FVG cùng hướng context, M2 xác nhận.
 - `BreakoutRetest`: dùng trong range/compression, breakout rồi retest.
 
+Từng strategy có input bật/tắt riêng: `InpEnableTrendPullback`, `InpEnableLiquiditySweep`, `InpEnableFvgRetracement`, `InpEnableBreakoutRetest`. Dùng các toggle này để test core strategy trước khi bật full hybrid.
+
 Mỗi candidate được chấm 0-100 theo:
 
 - M15 direction/context
@@ -47,6 +49,8 @@ Mỗi candidate được chấm 0-100 theo:
 Hard filter chủ yếu nằm ở risk/safety: spread, drawdown, max lot, max basket risk, max trades/hour, margin usage, consecutive losses, price deviation và duplicate/chasing guard.
 
 Spread filter có adaptive limit cho broker suffix/cent account: `InpMaxSpreadPoints` là base, `InpUseAdaptiveSpreadLimit` sẽ nâng ngưỡng theo `SYMBOL_SPREAD * InpSpreadLimitMultiplier` nhưng không vượt `InpAdaptiveSpreadCapPoints`. Điều này tránh trường hợp backtest XAUUSD suffix có spread 240-280 points nhưng EA bị chặn cứng ở 120 points.
+
+Consecutive-loss guard có cooldown bằng `InpConsecutiveLossCooldownHours`. Nếu đạt `InpMaxConsecutiveLosses`, EA dừng entry mới trong thời gian cooldown thay vì bị kẹt `NO_NEW_ENTRY` gần như vĩnh viễn trong backtest dài.
 
 ## Chống quá chặt nhưng không vào bừa
 

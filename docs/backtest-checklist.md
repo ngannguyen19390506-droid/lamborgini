@@ -34,6 +34,7 @@ Nếu 1-2 tháng không có lệnh, thử:
 
 Nếu EA vào lệnh quá dễ, thử:
 
+- tắt riêng strategy yếu bằng `InpEnableBreakoutRetest`, `InpEnableTrendPullback`, rồi test lại core `FVGRetracement` + `LiquiditySweep`
 - lọc `LamborghiniEA_daily_events.csv` theo `score_bucket`, giữ lại bucket có profit/MAE/MFE tốt hơn
 - tăng `InpMinAdaptiveEntryScore`
 - tăng `InpMinLocationScore`
@@ -53,6 +54,7 @@ Chạy `InpLotMode = LOT_FIXED` và lot nhỏ để đánh giá:
 - session nào hoạt động tốt
 - drawdown đến từ strategy nào
 - MAE/MFE trung bình của lệnh đóng theo `LamborghiniEA_daily_summary.csv`
+- `REJECT_STATE` có phải do `NO_NEW_ENTRY:consecutive_losses` không; nếu có, chỉnh `InpConsecutiveLossCooldownHours` thay vì để EA đứng quá lâu
 
 Sau đó mới chuyển sang `LOT_SMART`.
 

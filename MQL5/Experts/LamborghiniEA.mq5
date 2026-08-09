@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Lamborghini EA"
 #property link      "https://github.com/ngannguyen19390506-droid/lamborgini"
-#property version   "1.03"
+#property version   "1.04"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -147,6 +147,12 @@ input int             InpMinSweepPaScore          = 8;
 input int             InpMinLocationScore         = 7;
 input bool            InpRequirePendingForWeakPA  = true;
 
+input group "Strategy Enables"
+input bool            InpEnableTrendPullback      = true;
+input bool            InpEnableLiquiditySweep     = true;
+input bool            InpEnableFvgRetracement     = true;
+input bool            InpEnableBreakoutRetest     = true;
+
 input group "Indicators"
 input int             InpEmaFast                  = 21;
 input int             InpEmaSlow                  = 55;
@@ -216,6 +222,7 @@ input double          InpMaxTotalLot               = 0.40;
 input int             InpMaxPositionsPerBasket     = 3;
 input int             InpMaxTradesPerHour          = 6;
 input int             InpMaxConsecutiveLosses      = 5;
+input double          InpConsecutiveLossCooldownHours = 8.0;
 input double          InpMaxMarginUsagePct         = 45.0;
 input int             InpMaxSpreadPoints           = 120;
 input bool            InpUseAdaptiveSpreadLimit    = true;
@@ -472,14 +479,26 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 TradeSignal FindBestSignal(const RegimeInfo &regime)
 {
    TradeSignal best = EmptySignal();
-   KeepBest(best, DetectTrendPullback(DIR_BUY, regime));
-   KeepBest(best, DetectTrendPullback(DIR_SELL, regime));
-   KeepBest(best, DetectLiquiditySweep(DIR_BUY, regime));
-   KeepBest(best, DetectLiquiditySweep(DIR_SELL, regime));
-   KeepBest(best, DetectFvgRetracement(DIR_BUY, regime));
-   KeepBest(best, DetectFvgRetracement(DIR_SELL, regime));
-   KeepBest(best, DetectBreakoutRetest(DIR_BUY, regime));
-   KeepBest(best, DetectBreakoutRetest(DIR_SELL, regime));
+   if(InpEnableTrendPullback)
+   {
+      KeepBest(best, DetectTrendPullback(DIR_BUY, regime));
+      KeepBest(best, DetectTrendPullback(DIR_SELL, regime));
+   }
+   if(InpEnableLiquiditySweep)
+   {
+      KeepBest(best, DetectLiquiditySweep(DIR_BUY, regime));
+      KeepBest(best, DetectLiquiditySweep(DIR_SELL, regime));
+   }
+   if(InpEnableFvgRetracement)
+   {
+      KeepBest(best, DetectFvgRetracement(DIR_BUY, regime));
+      KeepBest(best, DetectFvgRetracement(DIR_SELL, regime));
+   }
+   if(InpEnableBreakoutRetest)
+   {
+      KeepBest(best, DetectBreakoutRetest(DIR_BUY, regime));
+      KeepBest(best, DetectBreakoutRetest(DIR_SELL, regime));
+   }
    return best;
 }
 
@@ -735,7 +754,8 @@ void TryOpenSignal(const TradeSignal &signal, const TradingState state)
    if(!StateAllowsEntry(state, hasBasket, isRecovery))
    {
       WriteJournal("REJECT_STATE", DirectionName(signal.direction), signal.strategy,
-                   StateName(state), signal.score, signal.idealEntry, signal.sl, signal.tp,
+                   StateBlockReason(state, sameBasket, oppositeBasket),
+                   signal.score, signal.idealEntry, signal.sl, signal.tp,
                    0.0, 0.0, 0.0, 0.0, signal.reason);
       return;
    }
@@ -1161,6 +1181,40 @@ TradingState EffectiveTradingState(const BasketInfo &buyBasket,
       return STATE_NO_NEW_ENTRY;
 
    return STATE_RUNNING;
+}
+
+string StateBlockReason(const TradingState state,
+                        const BasketInfo &sameBasket,
+                        const BasketInfo &oppositeBasket)
+{
+   if(state == STATE_RUNNING)
+      return "RUNNING";
+   if(state == STATE_RECOVERY_ONLY)
+      return "RECOVERY_ONLY";
+   if(state == STATE_EMERGENCY)
+      return "EMERGENCY_DD";
+   if(state != STATE_NO_NEW_ENTRY)
+      return StateName(state);
+
+   double dd = CurrentDrawdownPct();
+   double floating = sameBasket.floating + oppositeBasket.floating;
+   double marginUsage = MarginUsagePct();
+   int losses = ConsecutiveLosses();
+
+   if(dd >= InpMaxDrawdownPct)
+      return StringFormat("NO_NEW_ENTRY:drawdown=%.2f", dd);
+   if(InpMaxFloatingLossMoney > 0.0 && floating <= -InpMaxFloatingLossMoney)
+      return StringFormat("NO_NEW_ENTRY:floating=%.2f", floating);
+   if(InpMaxBasketLossMoney > 0.0 &&
+      (sameBasket.floating <= -InpMaxBasketLossMoney ||
+       oppositeBasket.floating <= -InpMaxBasketLossMoney))
+      return "NO_NEW_ENTRY:basket_loss";
+   if(marginUsage >= InpMaxMarginUsagePct)
+      return StringFormat("NO_NEW_ENTRY:margin=%.2f", marginUsage);
+   if(losses >= InpMaxConsecutiveLosses)
+      return StringFormat("NO_NEW_ENTRY:consecutive_losses=%d", losses);
+
+   return "NO_NEW_ENTRY";
 }
 
 //+------------------------------------------------------------------+
@@ -2404,6 +2458,7 @@ int ConsecutiveLosses()
       return 0;
 
    int losses = 0;
+   datetime lastLossTime = 0;
    for(int i = HistoryDealsTotal() - 1; i >= 0; --i)
    {
       ulong deal = HistoryDealGetTicket(i);
@@ -2422,10 +2477,24 @@ int ConsecutiveLosses()
                  + HistoryDealGetDouble(deal, DEAL_SWAP)
                  + HistoryDealGetDouble(deal, DEAL_COMMISSION);
       if(pnl < 0.0)
+      {
+         if(lastLossTime == 0)
+            lastLossTime = (datetime)HistoryDealGetInteger(deal, DEAL_TIME);
          losses++;
+      }
       else if(pnl > 0.0)
          break;
    }
+
+   if(losses >= InpMaxConsecutiveLosses &&
+      InpConsecutiveLossCooldownHours > 0.0 &&
+      lastLossTime > 0)
+   {
+      int cooldownSeconds = (int)MathRound(InpConsecutiveLossCooldownHours * 3600.0);
+      if(cooldownSeconds > 0 && TimeCurrent() - lastLossTime >= cooldownSeconds)
+         return 0;
+   }
+
    return losses;
 }
 
