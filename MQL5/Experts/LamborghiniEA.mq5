@@ -218,6 +218,9 @@ input int             InpMaxTradesPerHour          = 6;
 input int             InpMaxConsecutiveLosses      = 5;
 input double          InpMaxMarginUsagePct         = 45.0;
 input int             InpMaxSpreadPoints           = 120;
+input bool            InpUseAdaptiveSpreadLimit    = true;
+input double          InpSpreadLimitMultiplier     = 1.35;
+input int             InpAdaptiveSpreadCapPoints   = 360;
 input double          InpMinReentrySpacingAtr      = 0.70;
 
 input group "Basket Management"
@@ -343,6 +346,9 @@ int OnInit()
 
    Print("LamborghiniEA initialized on ", TradeSymbol,
          ". Attach to the traded symbol chart for live ticks.");
+   Print("Spread guard base=", InpMaxSpreadPoints,
+         ", adaptive=", (InpUseAdaptiveSpreadLimit ? "true" : "false"),
+         ", effective_now=", EffectiveMaxSpreadPoints());
    return INIT_SUCCEEDED;
 }
 
@@ -879,11 +885,14 @@ bool ExecutionGuard(const TradeSignal &signal, const BasketInfo &sameBasket)
    if(!TerminalInfoInteger(TERMINAL_CONNECTED))
       return false;
 
-   if(SpreadPoints() > InpMaxSpreadPoints)
+   double spread = SpreadPoints();
+   int maxSpread = EffectiveMaxSpreadPoints();
+   if(spread > maxSpread)
    {
       WriteJournal("REJECT_SPREAD", DirectionName(signal.direction), signal.strategy, "",
                    signal.score, signal.idealEntry, signal.sl, signal.tp,
-                   0.0, signal.rr, SpreadPoints(), 0.0, signal.reason);
+                   0.0, signal.rr, spread, 0.0,
+                   StringFormat("spread=%.1f; max=%d; %s", spread, maxSpread, signal.reason));
       return false;
    }
 
@@ -1759,11 +1768,27 @@ int VolatilityScore(const RegimeInfo &regime)
 int SpreadScore()
 {
    double spread = SpreadPoints();
-   if(spread <= InpMaxSpreadPoints * 0.50)
+   int maxSpread = EffectiveMaxSpreadPoints();
+   if(spread <= maxSpread * 0.50)
       return 5;
-   if(spread <= InpMaxSpreadPoints)
+   if(spread <= maxSpread)
       return 3;
    return 0;
+}
+
+int EffectiveMaxSpreadPoints()
+{
+   int configured = MathMax(1, InpMaxSpreadPoints);
+   if(!InpUseAdaptiveSpreadLimit)
+      return configured;
+
+   long brokerSpread = SymbolInfoInteger(TradeSymbol, SYMBOL_SPREAD);
+   if(brokerSpread <= 0)
+      return configured;
+
+   int cap = MathMax(configured, InpAdaptiveSpreadCapPoints);
+   int adaptive = (int)MathRound((double)brokerSpread * MathMax(1.0, InpSpreadLimitMultiplier));
+   return ClampInt(adaptive, configured, cap);
 }
 
 int SessionScore()

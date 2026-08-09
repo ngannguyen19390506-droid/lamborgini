@@ -46,6 +46,8 @@ Mỗi candidate được chấm 0-100 theo:
 
 Hard filter chủ yếu nằm ở risk/safety: spread, drawdown, max lot, max basket risk, max trades/hour, margin usage, consecutive losses, price deviation và duplicate/chasing guard.
 
+Spread filter có adaptive limit cho broker suffix/cent account: `InpMaxSpreadPoints` là base, `InpUseAdaptiveSpreadLimit` sẽ nâng ngưỡng theo `SYMBOL_SPREAD * InpSpreadLimitMultiplier` nhưng không vượt `InpAdaptiveSpreadCapPoints`. Điều này tránh trường hợp backtest XAUUSD suffix có spread 240-280 points nhưng EA bị chặn cứng ở 120 points.
+
 ## Chống quá chặt nhưng không vào bừa
 
 Từ bản `1.02`, EA dùng adaptive threshold và component quality gate:

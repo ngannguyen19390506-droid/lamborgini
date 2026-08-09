@@ -29,7 +29,7 @@ Nếu 1-2 tháng không có lệnh, thử:
 - kiểm tra reason có `scores=ctx,str,set,loc,pa...` để biết thiếu điểm ở thành phần nào
 - đặt `InpSkipIfRoomTooSmall = false`
 - tăng nhẹ `InpMaxEntryAtrDeviation`
-- tăng `InpMaxSpreadPoints` theo spread thực tế của broker
+- kiểm tra `REJECT_SPREAD`: nếu spread broker thường cao hơn `InpMaxSpreadPoints`, bật `InpUseAdaptiveSpreadLimit` hoặc tăng `InpAdaptiveSpreadCapPoints` vừa đủ theo spread thực tế
 - nếu pending quá ít khớp, giảm `InpMinPendingDistancePoints` hoặc tăng `InpPendingExpiryBars`
 
 Nếu EA vào lệnh quá dễ, thử:
