@@ -22,10 +22,20 @@ Theo dõi trong journal:
 Nếu 1-2 tháng không có lệnh, thử:
 
 - giảm `InpMinEntryScore` từ 75 xuống 70
+- bật `InpUseAdaptiveEntryThreshold`
+- kiểm tra reason có `scores=ctx,str,set,loc,pa...` để biết thiếu điểm ở thành phần nào
 - đặt `InpSkipIfRoomTooSmall = false`
 - tăng nhẹ `InpMaxEntryAtrDeviation`
 - tăng `InpMaxSpreadPoints` theo spread thực tế của broker
 - nếu pending quá ít khớp, giảm `InpMinPendingDistancePoints` hoặc tăng `InpPendingExpiryBars`
+
+Nếu EA vào lệnh quá dễ, thử:
+
+- tăng `InpMinAdaptiveEntryScore`
+- tăng `InpMinLocationScore`
+- bật `InpRequirePendingForWeakPA`
+- tăng `InpWeakContextPenalty`
+- giảm `InpMaxPendingOrders`
 
 ## 2. Test logic trước khi test lot
 
@@ -44,6 +54,9 @@ Sau đó mới chuyển sang `LOT_SMART`.
 Optimize theo cụm nhỏ, tránh overfit:
 
 - score threshold: 68-85
+- adaptive min score: 68-75
+- weak context penalty: 4-10
+- minimum PA theo strategy: 3-8
 - EMA distance: 0.9-1.8 ATR
 - minimum RR: 1.2-2.2
 - ATR SL buffer: 0.2-0.7

@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Lamborghini EA"
 #property link      "https://github.com/ngannguyen19390506-droid/lamborgini"
-#property version   "1.01"
+#property version   "1.02"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -105,6 +105,15 @@ struct TradeSignal
    double invalidation;
    double rr;
    EntryExecution execution;
+   int contextScore;
+   int structureScore;
+   int setupScore;
+   int locationScore;
+   int paScore;
+   int momentumScore;
+   int volatilityScore;
+   int spreadScore;
+   int sessionScore;
    string reason;
 };
 
@@ -120,11 +129,23 @@ input bool            InpOneEntryPerM2Bar         = true;
 
 input group "Signal Scoring"
 input int             InpMinEntryScore            = 75;
+input bool            InpUseAdaptiveEntryThreshold= true;
+input int             InpMinAdaptiveEntryScore    = 70;
+input int             InpAlignedContextDiscount   = 3;
+input int             InpRangeSweepDiscount       = 2;
+input int             InpWeakContextPenalty       = 6;
+input int             InpHighVolatilityPenalty    = 3;
 input int             InpMinRecoveryScore         = 83;
 input int             InpRecoveryScoreStep        = 5;
 input int             InpMinPyramidScore          = 80;
 input int             InpCounterTrendScoreBump    = 8;
 input bool            InpAllowCounterTrendReversal= true;
+input int             InpMinPullbackPaScore       = 3;
+input int             InpMinFvgPaScore            = 3;
+input int             InpMinBreakoutPaScore       = 3;
+input int             InpMinSweepPaScore          = 8;
+input int             InpMinLocationScore         = 7;
+input bool            InpRequirePendingForWeakPA  = true;
 
 input group "Indicators"
 input int             InpEmaFast                  = 21;
@@ -440,7 +461,7 @@ TradeSignal DetectTrendPullback(const Direction dir, const RegimeInfo &regime)
       return s;
 
    SignalFeatures pa = AnalyzeTriggerPriceAction(dir);
-   if(pa.score < 5)
+   if(pa.score < InpMinPullbackPaScore)
       return s;
 
    int setupScore = 11;
@@ -450,14 +471,15 @@ TradeSignal DetectTrendPullback(const Direction dir, const RegimeInfo &regime)
                          + (FindActiveFvg(dir, fvgLow, fvgHigh) ? 4 : 0);
    locationScore = ClampInt(locationScore, 0, 15);
 
-   s.score = BuildScore(dir, regime, setupScore, locationScore, pa, "TrendPullback");
-   s.reason = StringFormat("regime=%s; zone=ema; distAtr=%.2f; pa=%s",
-                           regime.label, distanceAtr, pa.tags);
+   ApplyScore(s, dir, regime, setupScore, locationScore, pa, "TrendPullback");
 
    double desiredEntry = CurrentEntryPrice(dir);
    EntryExecution execution = EXEC_MARKET;
    double limitEntry = PullbackLimitPrice(dir, emaFast, atr);
-   if(InpUsePendingOrders && IsValidLimitPrice(dir, limitEntry))
+   bool canUseLimit = InpUsePendingOrders && IsValidLimitPrice(dir, limitEntry);
+   if(InpRequirePendingForWeakPA && pa.score < 5 && !canUseLimit)
+      return EmptySignal();
+   if(canUseLimit && (pa.score < 5 || BetterLimitThanMarket(dir, limitEntry)))
    {
       desiredEntry = limitEntry;
       execution = EXEC_LIMIT;
@@ -470,6 +492,8 @@ TradeSignal DetectTrendPullback(const Direction dir, const RegimeInfo &regime)
       return EmptySignal();
 
    s.execution = execution;
+   s.reason = StringFormat("regime=%s; zone=ema; distAtr=%.2f; pa=%s; %s",
+                           regime.label, distanceAtr, pa.tags, ScoreBreakdown(s));
    s.valid = true;
    return s;
 }
@@ -487,7 +511,7 @@ TradeSignal DetectLiquiditySweep(const Direction dir, const RegimeInfo &regime)
    if(!(pa.sweep && pa.reclaim))
       return s;
 
-   if(pa.score < 8)
+   if(pa.score < InpMinSweepPaScore)
       return s;
 
    int setupScore = 13;
@@ -495,11 +519,9 @@ TradeSignal DetectLiquiditySweep(const Direction dir, const RegimeInfo &regime)
                          + (IsPriceStretched(dir) ? 2 : 0);
    locationScore = ClampInt(locationScore, 0, 15);
 
-   s.score = BuildScore(dir, regime, setupScore, locationScore, pa, "LiquiditySweep");
+   ApplyScore(s, dir, regime, setupScore, locationScore, pa, "LiquiditySweep");
    if(IsStrongOpposite(dir, regime.regime))
-      s.score -= InpCounterTrendScoreBump;
-
-   s.reason = StringFormat("regime=%s; sweep_reclaim=true; pa=%s", regime.label, pa.tags);
+      s.score = ClampInt(s.score - InpCounterTrendScoreBump, 0, 100);
 
    double invalidation = (dir == DIR_BUY)
                          ? iLow(TradeSymbol, InpTriggerTf, 1)
@@ -508,6 +530,8 @@ TradeSignal DetectLiquiditySweep(const Direction dir, const RegimeInfo &regime)
       return EmptySignal();
 
    s.execution = EXEC_MARKET;
+   s.reason = StringFormat("regime=%s; sweep_reclaim=true; pa=%s; %s",
+                           regime.label, pa.tags, ScoreBreakdown(s));
    s.valid = true;
    return s;
 }
@@ -527,21 +551,22 @@ TradeSignal DetectFvgRetracement(const Direction dir, const RegimeInfo &regime)
       return s;
 
    SignalFeatures pa = AnalyzeTriggerPriceAction(dir);
-   if(pa.score < 5)
+   if(pa.score < InpMinFvgPaScore)
       return s;
 
    int setupScore = 12;
    int locationScore = 13 + (NearSupportResistance(dir, InpSetupTf) ? 2 : 0);
    locationScore = ClampInt(locationScore, 0, 15);
 
-   s.score = BuildScore(dir, regime, setupScore, locationScore, pa, "FVGRetracement");
-   s.reason = StringFormat("regime=%s; fvg=%.2f-%.2f; pa=%s",
-                           regime.label, zoneLow, zoneHigh, pa.tags);
+   ApplyScore(s, dir, regime, setupScore, locationScore, pa, "FVGRetracement");
 
    double desiredEntry = CurrentEntryPrice(dir);
    EntryExecution execution = EXEC_MARKET;
    double limitEntry = NormalizePrice((zoneLow + zoneHigh) * 0.5);
-   if(InpUsePendingOrders && IsValidLimitPrice(dir, limitEntry))
+   bool canUseLimit = InpUsePendingOrders && IsValidLimitPrice(dir, limitEntry);
+   if(InpRequirePendingForWeakPA && pa.score < 5 && !canUseLimit)
+      return EmptySignal();
+   if(canUseLimit && (pa.score < 5 || BetterLimitThanMarket(dir, limitEntry)))
    {
       desiredEntry = limitEntry;
       execution = EXEC_LIMIT;
@@ -552,6 +577,8 @@ TradeSignal DetectFvgRetracement(const Direction dir, const RegimeInfo &regime)
       return EmptySignal();
 
    s.execution = execution;
+   s.reason = StringFormat("regime=%s; fvg=%.2f-%.2f; pa=%s; %s",
+                           regime.label, zoneLow, zoneHigh, pa.tags, ScoreBreakdown(s));
    s.valid = true;
    return s;
 }
@@ -596,18 +623,20 @@ TradeSignal DetectBreakoutRetest(const Direction dir, const RegimeInfo &regime)
       return s;
 
    SignalFeatures pa = AnalyzeTriggerPriceAction(dir);
-   if(pa.score < 4)
+   if(pa.score < InpMinBreakoutPaScore)
       return s;
 
    int setupScore = 12;
    int locationScore = 12;
-   s.score = BuildScore(dir, regime, setupScore, locationScore, pa, "BreakoutRetest");
-   s.reason = StringFormat("regime=%s; boundary=%.2f; pa=%s", regime.label, boundary, pa.tags);
+   ApplyScore(s, dir, regime, setupScore, locationScore, pa, "BreakoutRetest");
 
    double desiredEntry = CurrentEntryPrice(dir);
    EntryExecution execution = EXEC_MARKET;
    double stopEntry = BreakoutStopPrice(dir, atr);
-   if(InpUsePendingOrders && IsValidStopPrice(dir, stopEntry))
+   bool canUseStop = InpUsePendingOrders && IsValidStopPrice(dir, stopEntry);
+   if(InpRequirePendingForWeakPA && pa.score < 4 && !canUseStop)
+      return EmptySignal();
+   if(canUseStop && (pa.score < 4 || BetterStopThanMarket(dir, stopEntry)))
    {
       desiredEntry = stopEntry;
       execution = EXEC_STOP;
@@ -618,6 +647,8 @@ TradeSignal DetectBreakoutRetest(const Direction dir, const RegimeInfo &regime)
       return EmptySignal();
 
    s.execution = execution;
+   s.reason = StringFormat("regime=%s; boundary=%.2f; pa=%s; %s",
+                           regime.label, boundary, pa.tags, ScoreBreakdown(s));
    s.valid = true;
    return s;
 }
@@ -647,7 +678,16 @@ void TryOpenSignal(const TradeSignal &signal, const TradingState state)
    if(!InpAllowHedgedBaskets && oppositeBasket.count > 0)
       return;
 
-   int requiredScore = RequiredScoreFor(signal.direction, sameBasket, isRecovery, isPyramid);
+   if(!PassQualityGate(signal))
+   {
+      WriteJournal("REJECT_QUALITY_GATE", DirectionName(signal.direction), signal.strategy,
+                   "", signal.score, signal.idealEntry, signal.sl, signal.tp,
+                   0.0, 0.0, 0.0, 0.0, signal.reason,
+                   ExecutionName(signal.execution), signal.orderPrice);
+      return;
+   }
+
+   int requiredScore = RequiredScoreFor(signal, sameBasket, isRecovery, isPyramid);
    if(signal.score < requiredScore)
    {
       WriteJournal("REJECT_SCORE", DirectionName(signal.direction), signal.strategy,
@@ -941,18 +981,78 @@ bool ExposureGuard(const TradeSignal &signal, const double newLot, const BasketI
    return true;
 }
 
-int RequiredScoreFor(const Direction dir,
+int RequiredScoreFor(const TradeSignal &signal,
                      const BasketInfo &basket,
                      const bool isRecovery,
                      const bool isPyramid)
 {
+   int required = InpMinEntryScore;
+
    if(basket.count <= 0)
-      return InpMinEntryScore;
+   {
+      if(InpUseAdaptiveEntryThreshold)
+      {
+         if(signal.contextScore >= 13 && signal.structureScore >= 10 && signal.paScore >= 5)
+            required -= InpAlignedContextDiscount;
+         if(signal.strategy == "LiquiditySweep" && signal.contextScore >= 13)
+            required -= InpRangeSweepDiscount;
+         if(signal.contextScore <= 5)
+            required += InpWeakContextPenalty;
+         if(signal.volatilityScore <= 2)
+            required += InpHighVolatilityPenalty;
+      }
+      return ClampInt(required, InpMinAdaptiveEntryScore, 95);
+   }
+
    if(isRecovery)
-      return InpMinRecoveryScore + MathMax(0, basket.count - 1) * InpRecoveryScoreStep;
+   {
+      required = InpMinRecoveryScore + MathMax(0, basket.count - 1) * InpRecoveryScoreStep;
+      if(signal.contextScore <= 5)
+         required += InpWeakContextPenalty;
+      if(signal.volatilityScore <= 2)
+         required += InpHighVolatilityPenalty;
+      return ClampInt(required, InpMinRecoveryScore, 98);
+   }
+
    if(isPyramid)
-      return InpMinPyramidScore;
+   {
+      required = InpMinPyramidScore;
+      if(signal.contextScore <= 8)
+         required += InpWeakContextPenalty;
+      return ClampInt(required, InpMinPyramidScore, 95);
+   }
+
    return InpMinEntryScore;
+}
+
+bool PassQualityGate(const TradeSignal &signal)
+{
+   if(signal.contextScore <= 0 || signal.volatilityScore <= 0)
+      return false;
+
+   if(signal.locationScore < InpMinLocationScore)
+      return false;
+
+   if(signal.strategy == "LiquiditySweep" && signal.paScore < InpMinSweepPaScore)
+      return false;
+   if(signal.strategy == "TrendPullback" && signal.paScore < InpMinPullbackPaScore)
+      return false;
+   if(signal.strategy == "FVGRetracement" && signal.paScore < InpMinFvgPaScore)
+      return false;
+   if(signal.strategy == "BreakoutRetest" && signal.paScore < InpMinBreakoutPaScore)
+      return false;
+
+   if(InpRequirePendingForWeakPA && signal.execution == EXEC_MARKET)
+   {
+      if(signal.strategy == "TrendPullback" && signal.paScore < 5)
+         return false;
+      if(signal.strategy == "FVGRetracement" && signal.paScore < 5)
+         return false;
+      if(signal.strategy == "BreakoutRetest" && signal.paScore < 4)
+         return false;
+   }
+
+   return true;
 }
 
 bool StateAllowsEntry(const TradingState state,
@@ -1299,6 +1399,50 @@ int BuildScore(const Direction dir,
    return ClampInt(score, 0, 100);
 }
 
+void ApplyScore(TradeSignal &signal,
+                const Direction dir,
+                const RegimeInfo &regime,
+                const int setupScore,
+                const int locationScore,
+                const SignalFeatures &pa,
+                const string strategy)
+{
+   signal.contextScore = DirectionContextScore(dir, regime.regime, strategy);
+   signal.structureScore = StructureScore(dir, InpSetupTf);
+   signal.setupScore = ClampInt(setupScore, 0, 15);
+   signal.locationScore = ClampInt(locationScore, 0, 15);
+   signal.paScore = ClampInt(pa.score, 0, 15);
+   signal.momentumScore = MomentumScore(dir);
+   signal.volatilityScore = VolatilityScore(regime);
+   signal.spreadScore = SpreadScore();
+   signal.sessionScore = SessionScore();
+
+   signal.score = ClampInt(signal.contextScore +
+                           signal.structureScore +
+                           signal.setupScore +
+                           signal.locationScore +
+                           signal.paScore +
+                           signal.momentumScore +
+                           signal.volatilityScore +
+                           signal.spreadScore +
+                           signal.sessionScore, 0, 100);
+}
+
+string ScoreBreakdown(const TradeSignal &signal)
+{
+   return StringFormat("scores=ctx:%d,str:%d,set:%d,loc:%d,pa:%d,mom:%d,vol:%d,spr:%d,ses:%d,total:%d",
+                       signal.contextScore,
+                       signal.structureScore,
+                       signal.setupScore,
+                       signal.locationScore,
+                       signal.paScore,
+                       signal.momentumScore,
+                       signal.volatilityScore,
+                       signal.spreadScore,
+                       signal.sessionScore,
+                       signal.score);
+}
+
 int DirectionContextScore(const Direction dir,
                           const MarketRegime regime,
                           const string strategy)
@@ -1584,6 +1728,30 @@ bool IsValidStopPrice(const Direction dir, const double price)
       return price > tick.ask + minDistance;
    if(dir == DIR_SELL)
       return price < tick.bid - minDistance;
+   return false;
+}
+
+bool BetterLimitThanMarket(const Direction dir, const double price)
+{
+   double current = CurrentEntryPrice(dir);
+   if(current <= 0.0 || price <= 0.0)
+      return false;
+   if(dir == DIR_BUY)
+      return price < current;
+   if(dir == DIR_SELL)
+      return price > current;
+   return false;
+}
+
+bool BetterStopThanMarket(const Direction dir, const double price)
+{
+   double current = CurrentEntryPrice(dir);
+   if(current <= 0.0 || price <= 0.0)
+      return false;
+   if(dir == DIR_BUY)
+      return price > current;
+   if(dir == DIR_SELL)
+      return price < current;
    return false;
 }
 
@@ -2187,6 +2355,15 @@ TradeSignal EmptySignal()
    s.invalidation = 0.0;
    s.rr = 0.0;
    s.execution = EXEC_MARKET;
+   s.contextScore = 0;
+   s.structureScore = 0;
+   s.setupScore = 0;
+   s.locationScore = 0;
+   s.paScore = 0;
+   s.momentumScore = 0;
+   s.volatilityScore = 0;
+   s.spreadScore = 0;
+   s.sessionScore = 0;
    s.reason = "";
    return s;
 }

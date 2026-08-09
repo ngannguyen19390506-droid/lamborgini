@@ -45,6 +45,18 @@ Mỗi candidate được chấm 0-100 theo:
 
 Hard filter chủ yếu nằm ở risk/safety: spread, drawdown, max lot, max basket risk, max trades/hour, margin usage, consecutive losses, price deviation và duplicate/chasing guard.
 
+## Chống quá chặt nhưng không vào bừa
+
+Từ bản `1.02`, EA dùng adaptive threshold và component quality gate:
+
+- Setup đúng trend/context, structure tốt và PA đủ rõ có thể được giảm nhẹ ngưỡng entry bằng `InpAlignedContextDiscount`.
+- Sweep trong range có thể được giảm nhẹ bằng `InpRangeSweepDiscount`.
+- Context yếu hoặc volatility cao bị tăng ngưỡng bằng `InpWeakContextPenalty` và `InpHighVolatilityPenalty`.
+- Trend/FVG/Breakout có PA yếu hơn vẫn được xét, nhưng nếu `InpRequirePendingForWeakPA = true` thì chỉ được vào bằng LIMIT/STOP, không được market.
+- Mọi tín hiệu vẫn phải vượt `InpMinLocationScore` và các ngưỡng PA tối thiểu theo strategy.
+
+Mục tiêu là giữ số lệnh đủ để backtest có dữ liệu, nhưng lệnh yếu phải đổi bằng giá entry tốt hơn thay vì vào đuổi.
+
 ## Entry execution
 
 EA hiện hỗ trợ 3 kiểu vào lệnh:
@@ -111,6 +123,11 @@ Nên bắt đầu bằng Strategy Tester:
 Các tham số nên optimize trước:
 
 - `InpMinEntryScore`
+- `InpUseAdaptiveEntryThreshold`
+- `InpMinAdaptiveEntryScore`
+- `InpAlignedContextDiscount`
+- `InpWeakContextPenalty`
+- `InpRequirePendingForWeakPA`
 - `InpMinRecoveryScore`
 - `InpMaxEmaAtrDistance`
 - `InpMinExpectedRR`
