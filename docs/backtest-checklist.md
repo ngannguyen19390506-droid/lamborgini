@@ -6,6 +6,7 @@ Mục tiêu đầu tiên chưa phải profit, mà là xem bot có quá chặt kh
 
 Theo dõi trong journal:
 
+- `CANDIDATE`
 - `REJECT_SCORE`
 - `REJECT_SPREAD`
 - `REJECT_CHASE`
@@ -18,10 +19,12 @@ Theo dõi trong journal:
 - `ENTRY`
 - `ENTRY_RECOVERY`
 - `ENTRY_PYRAMID`
+- `EXIT`
 
 Nếu 1-2 tháng không có lệnh, thử:
 
 - giảm `InpMinEntryScore` từ 75 xuống 70
+- kiểm tra `LamborghiniEA_daily_events.csv`: nếu có nhiều `CANDIDATE` nhưng bị `REJECT_SCORE`, nới score; nếu bị `REJECT_CHASE`/`REJECT_PENDING_PRICE`, chỉnh entry/pending thay vì hạ score
 - bật `InpUseAdaptiveEntryThreshold`
 - kiểm tra reason có `scores=ctx,str,set,loc,pa...` để biết thiếu điểm ở thành phần nào
 - đặt `InpSkipIfRoomTooSmall = false`
@@ -31,6 +34,7 @@ Nếu 1-2 tháng không có lệnh, thử:
 
 Nếu EA vào lệnh quá dễ, thử:
 
+- lọc `LamborghiniEA_daily_events.csv` theo `score_bucket`, giữ lại bucket có profit/MAE/MFE tốt hơn
 - tăng `InpMinAdaptiveEntryScore`
 - tăng `InpMinLocationScore`
 - bật `InpRequirePendingForWeakPA`
@@ -42,10 +46,13 @@ Nếu EA vào lệnh quá dễ, thử:
 Chạy `InpLotMode = LOT_FIXED` và lot nhỏ để đánh giá:
 
 - số candidate được nhận
+- tỷ lệ `CANDIDATE` -> `ENTRY` theo ngày
+- reject reason nào xuất hiện nhiều nhất trong ngày
 - strategy nào tạo nhiều lệnh
 - score bucket nào có edge
 - session nào hoạt động tốt
 - drawdown đến từ strategy nào
+- MAE/MFE trung bình của lệnh đóng theo `LamborghiniEA_daily_summary.csv`
 
 Sau đó mới chuyển sang `LOT_SMART`.
 

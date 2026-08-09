@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Lamborghini EA"
 #property link      "https://github.com/ngannguyen19390506-droid/lamborgini"
-#property version   "1.02"
+#property version   "1.03"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -242,6 +242,11 @@ input int             InpCustomSessionEndGmt       = -1;
 input group "Journal"
 input bool            InpWriteJournal              = true;
 input string          InpJournalFileName           = "LamborghiniEA_journal.csv";
+input bool            InpTrackMaeMfe               = true;
+input bool            InpWriteCandidateEvents      = true;
+input bool            InpWriteDailyAnalysis        = true;
+input string          InpDailyEventFileName        = "LamborghiniEA_daily_events.csv";
+input string          InpDailySummaryFileName      = "LamborghiniEA_daily_summary.csv";
 
 CTrade Trade;
 
@@ -265,6 +270,7 @@ datetime g_lastSignalBar = 0;
 datetime g_lastBuyEntryBar = 0;
 datetime g_lastSellEntryBar = 0;
 double g_peakEquity = 0.0;
+string g_activeAnalysisDate = "";
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                             |
@@ -309,6 +315,7 @@ int OnInit()
    }
 
    InitJournal();
+   InitDailyAnalytics();
 
    Print("LamborghiniEA initialized on ", TradeSymbol,
          ". Attach to the traded symbol chart for live ticks.");
@@ -317,6 +324,8 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   FlushDailySummary(g_activeAnalysisDate, "deinit");
+
    ReleaseHandle(hEmaFastContext);
    ReleaseHandle(hEmaSlowContext);
    ReleaseHandle(hEmaFastSetup);
@@ -341,6 +350,7 @@ void OnTick()
       return;
 
    UpdatePeakEquity();
+   UpdatePositionExcursions();
 
    BasketInfo buyBasket;
    BasketInfo sellBasket;
@@ -371,6 +381,14 @@ void OnTick()
    if(!best.valid)
       return;
 
+   if(InpWriteCandidateEvents)
+   {
+      WriteJournal("CANDIDATE", DirectionName(best.direction), best.strategy,
+                   regime.label, best.score, best.idealEntry, best.sl, best.tp,
+                   0.0, best.rr, SpreadPoints(), 0.0, best.reason,
+                   ExecutionName(best.execution), best.orderPrice);
+   }
+
    TryOpenSignal(best, state);
 }
 
@@ -390,15 +408,32 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       return;
 
    long entryType = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   ulong positionId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+   if(entryType == DEAL_ENTRY_IN)
+   {
+      SeedPositionExcursion(positionId);
+      StorePositionStrategyCode(positionId, DealStrategyCode(trans.deal));
+      return;
+   }
+
    if(entryType != DEAL_ENTRY_OUT && entryType != DEAL_ENTRY_INOUT)
       return;
+
+   double maeMoney = 0.0;
+   double mfeMoney = 0.0;
+   ReadPositionExcursions(positionId, maeMoney, mfeMoney);
 
    double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
                  + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
                  + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
-   string side = (HistoryDealGetInteger(trans.deal, DEAL_TYPE) == DEAL_TYPE_BUY ? "BUY" : "SELL");
-   WriteJournal("EXIT", side, "", "", 0, 0.0, 0.0, 0.0, 0.0,
-                0.0, 0.0, profit, "deal_close");
+   long dealType = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+   string side = (dealType == DEAL_TYPE_SELL ? "BUY" : "SELL");
+   string strategyCode = PositionStrategyCode(positionId);
+   WriteJournal("EXIT", side, strategyCode, "", 0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, profit, "deal_close", "", 0.0, maeMoney, mfeMoney);
+
+   if(!PositionIdStillOpen(positionId))
+      DeletePositionExcursions(positionId);
 }
 
 //+------------------------------------------------------------------+
@@ -1328,6 +1363,165 @@ void CloseAllOwnedPositions(const string reason)
 
    WriteJournal("CLOSE_ALL", "", "", "", 0, 0.0, 0.0, 0.0,
                 0.0, 0.0, SpreadPoints(), 0.0, reason);
+}
+
+//+------------------------------------------------------------------+
+//| MAE/MFE tracking                                                  |
+//+------------------------------------------------------------------+
+void UpdatePositionExcursions()
+{
+   if(!InpTrackMaeMfe)
+      return;
+
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != TradeSymbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber)
+         continue;
+
+      ulong positionId = SelectedPositionId(ticket);
+      double floating = PositionFloatingMoney();
+      string maeKey = PositionExcursionKey("MAE", positionId);
+      string mfeKey = PositionExcursionKey("MFE", positionId);
+
+      double maeMoney = floating;
+      double mfeMoney = floating;
+      if(GlobalVariableCheck(maeKey))
+         maeMoney = GlobalVariableGet(maeKey);
+      if(GlobalVariableCheck(mfeKey))
+         mfeMoney = GlobalVariableGet(mfeKey);
+
+      if(floating < maeMoney)
+         maeMoney = floating;
+      if(floating > mfeMoney)
+         mfeMoney = floating;
+
+      GlobalVariableSet(maeKey, maeMoney);
+      GlobalVariableSet(mfeKey, mfeMoney);
+   }
+}
+
+void SeedPositionExcursion(const ulong positionId)
+{
+   if(!InpTrackMaeMfe || positionId == 0)
+      return;
+
+   double floating = 0.0;
+   if(!FindOpenPositionFloating(positionId, floating))
+      floating = 0.0;
+
+   string maeKey = PositionExcursionKey("MAE", positionId);
+   string mfeKey = PositionExcursionKey("MFE", positionId);
+   if(!GlobalVariableCheck(maeKey))
+      GlobalVariableSet(maeKey, floating);
+   if(!GlobalVariableCheck(mfeKey))
+      GlobalVariableSet(mfeKey, floating);
+}
+
+void ReadPositionExcursions(const ulong positionId, double &maeMoney, double &mfeMoney)
+{
+   maeMoney = 0.0;
+   mfeMoney = 0.0;
+   if(!InpTrackMaeMfe || positionId == 0)
+      return;
+
+   string maeKey = PositionExcursionKey("MAE", positionId);
+   string mfeKey = PositionExcursionKey("MFE", positionId);
+   if(GlobalVariableCheck(maeKey))
+      maeMoney = GlobalVariableGet(maeKey);
+   if(GlobalVariableCheck(mfeKey))
+      mfeMoney = GlobalVariableGet(mfeKey);
+}
+
+void DeletePositionExcursions(const ulong positionId)
+{
+   if(positionId == 0)
+      return;
+
+   GlobalVariableDel(PositionExcursionKey("MAE", positionId));
+   GlobalVariableDel(PositionExcursionKey("MFE", positionId));
+   GlobalVariableDel(PositionExcursionKey("STR", positionId));
+}
+
+void StorePositionStrategyCode(const ulong positionId, const string strategyCode)
+{
+   if(positionId == 0)
+      return;
+
+   int strategyId = StrategyIdFromCode(strategyCode);
+   if(strategyId <= 0)
+      return;
+
+   GlobalVariableSet(PositionExcursionKey("STR", positionId), (double)strategyId);
+}
+
+string PositionStrategyCode(const ulong positionId)
+{
+   if(positionId == 0)
+      return "";
+
+   string key = PositionExcursionKey("STR", positionId);
+   if(!GlobalVariableCheck(key))
+      return "";
+
+   int strategyId = (int)MathRound(GlobalVariableGet(key));
+   return StrategyCodeFromId(strategyId);
+}
+
+bool PositionIdStillOpen(const ulong positionId)
+{
+   double floating = 0.0;
+   return FindOpenPositionFloating(positionId, floating);
+}
+
+bool FindOpenPositionFloating(const ulong positionId, double &floating)
+{
+   floating = 0.0;
+   if(positionId == 0)
+      return false;
+
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != TradeSymbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber)
+         continue;
+
+      if(SelectedPositionId(ticket) != positionId)
+         continue;
+
+      floating = PositionFloatingMoney();
+      return true;
+   }
+
+   return false;
+}
+
+double PositionFloatingMoney()
+{
+   return PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+}
+
+ulong SelectedPositionId(const ulong ticket)
+{
+   long identifier = PositionGetInteger(POSITION_IDENTIFIER);
+   if(identifier > 0)
+      return (ulong)identifier;
+   return ticket;
+}
+
+string PositionExcursionKey(const string metric, const ulong positionId)
+{
+   return GvKey(metric + "_" + UlongToString(positionId));
 }
 
 //+------------------------------------------------------------------+
@@ -2446,11 +2640,50 @@ string PendingTypeName(const ENUM_ORDER_TYPE type)
 
 string ShortStrategyName(const string strategy)
 {
+   if(strategy == "TPB") return "TPB";
+   if(strategy == "SWP") return "SWP";
+   if(strategy == "FVG") return "FVG";
+   if(strategy == "BOR") return "BOR";
    if(strategy == "TrendPullback") return "TPB";
    if(strategy == "LiquiditySweep") return "SWP";
    if(strategy == "FVGRetracement") return "FVG";
    if(strategy == "BreakoutRetest") return "BOR";
    return "SIG";
+}
+
+string DealStrategyCode(const ulong deal)
+{
+   string comment = HistoryDealGetString(deal, DEAL_COMMENT);
+   int first = StringFind(comment, "|");
+   if(first < 0)
+      return "";
+
+   int second = StringFind(comment, "|", first + 1);
+   if(second <= first)
+      return "";
+
+   string code = StringSubstr(comment, first + 1, second - first - 1);
+   if(StrategyIdFromCode(code) <= 0)
+      return "";
+   return code;
+}
+
+int StrategyIdFromCode(const string code)
+{
+   if(code == "TPB") return 1;
+   if(code == "SWP") return 2;
+   if(code == "FVG") return 3;
+   if(code == "BOR") return 4;
+   return 0;
+}
+
+string StrategyCodeFromId(const int strategyId)
+{
+   if(strategyId == 1) return "TPB";
+   if(strategyId == 2) return "SWP";
+   if(strategyId == 3) return "FVG";
+   if(strategyId == 4) return "BOR";
+   return "";
 }
 
 string GvKey(const string name)
@@ -2478,9 +2711,20 @@ void InitJournal()
    {
       FileWrite(handle, "timestamp", "action", "symbol", "direction", "strategy",
                 "execution", "order_price", "context", "score", "entry", "sl", "tp", "lot", "rr",
-                "spread_points", "pnl_or_code", "equity", "drawdown_pct", "reason");
+                "spread_points", "pnl_or_code", "mae_money", "mfe_money",
+                "equity", "drawdown_pct", "reason");
    }
    FileClose(handle);
+}
+
+void InitDailyAnalytics()
+{
+   if(!InpWriteDailyAnalysis)
+      return;
+
+   g_activeAnalysisDate = DateKey(TimeCurrent());
+   InitDailyEventFile();
+   InitDailySummaryFile();
 }
 
 void WriteJournal(const string action,
@@ -2497,36 +2741,413 @@ void WriteJournal(const string action,
                   const double pnlOrCode,
                   const string reason,
                   const string execution = "",
-                  const double orderPrice = 0.0)
+                  const double orderPrice = 0.0,
+                  const double maeMoney = 0.0,
+                  const double mfeMoney = 0.0)
 {
-   if(!InpWriteJournal)
+   if(InpWriteJournal)
+   {
+      int handle = FileOpen(InpJournalFileName,
+                            FILE_READ | FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_ANSI);
+      if(handle != INVALID_HANDLE)
+      {
+         FileSeek(handle, 0, SEEK_END);
+         FileWrite(handle,
+                   TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS),
+                   action,
+                   TradeSymbol,
+                   direction,
+                   strategy,
+                   execution,
+                   DoubleToString(orderPrice, DigitsForSymbol()),
+                   context,
+                   score,
+                   DoubleToString(entry, DigitsForSymbol()),
+                   DoubleToString(sl, DigitsForSymbol()),
+                   DoubleToString(tp, DigitsForSymbol()),
+                   DoubleToString(lot, 2),
+                   DoubleToString(rr, 2),
+                   DoubleToString(spread, 1),
+                   DoubleToString(pnlOrCode, 2),
+                   DoubleToString(maeMoney, 2),
+                   DoubleToString(mfeMoney, 2),
+                   DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
+                   DoubleToString(CurrentDrawdownPct(), 2),
+                   reason);
+         FileClose(handle);
+      }
+   }
+
+   WriteDailyAnalysisEvent(action, direction, strategy, context, score, entry, sl, tp,
+                           lot, rr, spread, pnlOrCode, reason, execution, orderPrice,
+                           maeMoney, mfeMoney);
+}
+
+void InitDailyEventFile()
+{
+   int handle = FileOpen(InpDailyEventFileName,
+                         FILE_READ | FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+   {
+      Print("Cannot open daily event file: ", InpDailyEventFileName, " error=", GetLastError());
+      return;
+   }
+
+   if(FileSize(handle) == 0)
+   {
+      FileWrite(handle, "date", "timestamp", "symbol", "action_group", "action",
+                "direction", "strategy", "strategy_code", "execution", "context",
+                "score", "score_bucket", "entry", "order_price", "sl", "tp",
+                "lot", "rr", "spread_points", "pnl_or_code", "mae_money", "mfe_money",
+                "equity", "drawdown_pct", "reason_key", "reason");
+   }
+   FileClose(handle);
+}
+
+void InitDailySummaryFile()
+{
+   int handle = FileOpen(InpDailySummaryFileName,
+                         FILE_READ | FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+   {
+      Print("Cannot open daily summary file: ", InpDailySummaryFileName, " error=", GetLastError());
+      return;
+   }
+
+   if(FileSize(handle) == 0)
+   {
+      FileWrite(handle, "snapshot_time", "date", "symbol", "action_group",
+                "strategy_code", "count", "avg_score", "total_pnl",
+                "avg_mae", "avg_mfe", "source");
+   }
+   FileClose(handle);
+}
+
+void WriteDailyAnalysisEvent(const string action,
+                             const string direction,
+                             const string strategy,
+                             const string context,
+                             const int score,
+                             const double entry,
+                             const double sl,
+                             const double tp,
+                             const double lot,
+                             const double rr,
+                             const double spread,
+                             const double pnlOrCode,
+                             const string reason,
+                             const string execution,
+                             const double orderPrice,
+                             const double maeMoney,
+                             const double mfeMoney)
+{
+   if(!InpWriteDailyAnalysis)
       return;
 
-   int handle = FileOpen(InpJournalFileName,
+   string actionGroup = JournalActionGroup(action);
+   if(actionGroup == "")
+      return;
+
+   RollDailyAnalysisDay();
+   AppendDailyEvent(action, actionGroup, direction, strategy, context, score,
+                    entry, sl, tp, lot, rr, spread, pnlOrCode, reason,
+                    execution, orderPrice, maeMoney, mfeMoney);
+   UpdateDailyCounters(action, actionGroup, strategy, score, pnlOrCode,
+                       maeMoney, mfeMoney);
+}
+
+void RollDailyAnalysisDay()
+{
+   string today = DateKey(TimeCurrent());
+   if(g_activeAnalysisDate == "")
+   {
+      g_activeAnalysisDate = today;
+      return;
+   }
+
+   if(today == g_activeAnalysisDate)
+      return;
+
+   FlushDailySummary(g_activeAnalysisDate, "day_roll");
+   ClearDailyCounters(g_activeAnalysisDate);
+   g_activeAnalysisDate = today;
+}
+
+void AppendDailyEvent(const string action,
+                      const string actionGroup,
+                      const string direction,
+                      const string strategy,
+                      const string context,
+                      const int score,
+                      const double entry,
+                      const double sl,
+                      const double tp,
+                      const double lot,
+                      const double rr,
+                      const double spread,
+                      const double pnlOrCode,
+                      const string reason,
+                      const string execution,
+                      const double orderPrice,
+                      const double maeMoney,
+                      const double mfeMoney)
+{
+   int handle = FileOpen(InpDailyEventFileName,
                          FILE_READ | FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_ANSI);
    if(handle == INVALID_HANDLE)
       return;
 
    FileSeek(handle, 0, SEEK_END);
    FileWrite(handle,
+             DateKey(TimeCurrent()),
              TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS),
-             action,
              TradeSymbol,
+             actionGroup,
+             action,
              direction,
              strategy,
+             DailyStrategyCode(strategy),
              execution,
-             DoubleToString(orderPrice, DigitsForSymbol()),
              context,
              score,
+             ScoreBucket(score),
              DoubleToString(entry, DigitsForSymbol()),
+             DoubleToString(orderPrice, DigitsForSymbol()),
              DoubleToString(sl, DigitsForSymbol()),
              DoubleToString(tp, DigitsForSymbol()),
              DoubleToString(lot, 2),
              DoubleToString(rr, 2),
              DoubleToString(spread, 1),
              DoubleToString(pnlOrCode, 2),
+             DoubleToString(maeMoney, 2),
+             DoubleToString(mfeMoney, 2),
              DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
              DoubleToString(CurrentDrawdownPct(), 2),
+             ReasonKey(action, reason),
              reason);
    FileClose(handle);
+}
+
+void UpdateDailyCounters(const string action,
+                         const string actionGroup,
+                         const string strategy,
+                         const int score,
+                         const double pnlOrCode,
+                         const double maeMoney,
+                         const double mfeMoney)
+{
+   string actionCode = DailyActionCode(actionGroup);
+   string strategyCode = DailyStrategyCode(strategy);
+   string date = (g_activeAnalysisDate == "" ? DateKey(TimeCurrent()) : g_activeAnalysisDate);
+
+   AddDailyMetric(date, actionCode, strategyCode, "C", 1.0);
+   if(score > 0)
+   {
+      AddDailyMetric(date, actionCode, strategyCode, "SS", (double)score);
+      AddDailyMetric(date, actionCode, strategyCode, "SC", 1.0);
+   }
+
+   if(action == "EXIT")
+   {
+      AddDailyMetric(date, actionCode, strategyCode, "PNL", pnlOrCode);
+      AddDailyMetric(date, actionCode, strategyCode, "MAE", maeMoney);
+      AddDailyMetric(date, actionCode, strategyCode, "MFE", mfeMoney);
+      AddDailyMetric(date, actionCode, strategyCode, "EXC", 1.0);
+   }
+}
+
+void FlushDailySummary(const string date, const string source)
+{
+   if(!InpWriteDailyAnalysis || date == "")
+      return;
+
+   int handle = FileOpen(InpDailySummaryFileName,
+                         FILE_READ | FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+      return;
+
+   string actionCodes[7] = {"CAN", "REJ", "ENT", "FAIL", "EXT", "CLS", "CNP"};
+   string strategyCodes[6] = {"TPB", "SWP", "FVG", "BOR", "SIG", "NA"};
+
+   FileSeek(handle, 0, SEEK_END);
+   for(int a = 0; a < ArraySize(actionCodes); ++a)
+   {
+      for(int s = 0; s < ArraySize(strategyCodes); ++s)
+      {
+         double count = DailyMetric(date, actionCodes[a], strategyCodes[s], "C");
+         if(count <= 0.0)
+            continue;
+
+         double scoreCount = DailyMetric(date, actionCodes[a], strategyCodes[s], "SC");
+         double avgScore = (scoreCount > 0.0 ?
+                            DailyMetric(date, actionCodes[a], strategyCodes[s], "SS") / scoreCount : 0.0);
+         double excursionCount = DailyMetric(date, actionCodes[a], strategyCodes[s], "EXC");
+         double avgMae = (excursionCount > 0.0 ?
+                          DailyMetric(date, actionCodes[a], strategyCodes[s], "MAE") / excursionCount : 0.0);
+         double avgMfe = (excursionCount > 0.0 ?
+                          DailyMetric(date, actionCodes[a], strategyCodes[s], "MFE") / excursionCount : 0.0);
+
+         FileWrite(handle,
+                   TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS),
+                   date,
+                   TradeSymbol,
+                   ActionGroupName(actionCodes[a]),
+                   strategyCodes[s],
+                   DoubleToString(count, 0),
+                   DoubleToString(avgScore, 2),
+                   DoubleToString(DailyMetric(date, actionCodes[a], strategyCodes[s], "PNL"), 2),
+                   DoubleToString(avgMae, 2),
+                   DoubleToString(avgMfe, 2),
+                   source);
+      }
+   }
+
+   FileClose(handle);
+}
+
+void ClearDailyCounters(const string date)
+{
+   string actionCodes[7] = {"CAN", "REJ", "ENT", "FAIL", "EXT", "CLS", "CNP"};
+   string strategyCodes[6] = {"TPB", "SWP", "FVG", "BOR", "SIG", "NA"};
+   string metrics[7] = {"C", "SS", "SC", "PNL", "MAE", "MFE", "EXC"};
+
+   for(int a = 0; a < ArraySize(actionCodes); ++a)
+   {
+      for(int s = 0; s < ArraySize(strategyCodes); ++s)
+      {
+         for(int m = 0; m < ArraySize(metrics); ++m)
+            GlobalVariableDel(DailyMetricKey(date, actionCodes[a], strategyCodes[s], metrics[m]));
+      }
+   }
+}
+
+void AddDailyMetric(const string date,
+                    const string actionCode,
+                    const string strategyCode,
+                    const string metric,
+                    const double delta)
+{
+   string key = DailyMetricKey(date, actionCode, strategyCode, metric);
+   double value = 0.0;
+   if(GlobalVariableCheck(key))
+      value = GlobalVariableGet(key);
+   GlobalVariableSet(key, value + delta);
+}
+
+double DailyMetric(const string date,
+                   const string actionCode,
+                   const string strategyCode,
+                   const string metric)
+{
+   string key = DailyMetricKey(date, actionCode, strategyCode, metric);
+   if(GlobalVariableCheck(key))
+      return GlobalVariableGet(key);
+   return 0.0;
+}
+
+string DailyMetricKey(const string date,
+                      const string actionCode,
+                      const string strategyCode,
+                      const string metric)
+{
+   return GvKey("D" + DateToken(date) + "_" + actionCode + "_" + strategyCode + "_" + metric);
+}
+
+string JournalActionGroup(const string action)
+{
+   if(action == "CANDIDATE")
+      return "CANDIDATE";
+   if(StringFind(action, "REJECT_") == 0)
+      return "REJECT";
+   if(action == "ENTRY" || action == "ENTRY_RECOVERY" || action == "ENTRY_PYRAMID")
+      return "ENTRY";
+   if(action == "ORDER_FAILED")
+      return "ORDER_FAILED";
+   if(action == "EXIT")
+      return "EXIT";
+   if(action == "CLOSE_BASKET" || action == "CLOSE_ALL")
+      return "CLOSE";
+   if(StringFind(action, "CANCEL_PENDING") == 0)
+      return "CANCEL_PENDING";
+   return "";
+}
+
+string DailyActionCode(const string actionGroup)
+{
+   if(actionGroup == "CANDIDATE") return "CAN";
+   if(actionGroup == "REJECT") return "REJ";
+   if(actionGroup == "ENTRY") return "ENT";
+   if(actionGroup == "ORDER_FAILED") return "FAIL";
+   if(actionGroup == "EXIT") return "EXT";
+   if(actionGroup == "CLOSE") return "CLS";
+   if(actionGroup == "CANCEL_PENDING") return "CNP";
+   return "UNK";
+}
+
+string ActionGroupName(const string actionCode)
+{
+   if(actionCode == "CAN") return "CANDIDATE";
+   if(actionCode == "REJ") return "REJECT";
+   if(actionCode == "ENT") return "ENTRY";
+   if(actionCode == "FAIL") return "ORDER_FAILED";
+   if(actionCode == "EXT") return "EXIT";
+   if(actionCode == "CLS") return "CLOSE";
+   if(actionCode == "CNP") return "CANCEL_PENDING";
+   return "UNKNOWN";
+}
+
+string DailyStrategyCode(const string strategy)
+{
+   string code = ShortStrategyName(strategy);
+   if(code == "SIG")
+      return (strategy == "" ? "NA" : "SIG");
+   return code;
+}
+
+string ScoreBucket(const int score)
+{
+   if(score <= 0) return "";
+   if(score < 60) return "000_059";
+   if(score < 65) return "060_064";
+   if(score < 70) return "065_069";
+   if(score < 75) return "070_074";
+   if(score < 80) return "075_079";
+   if(score < 85) return "080_084";
+   if(score < 90) return "085_089";
+   return "090_100";
+}
+
+string ReasonKey(const string action, const string reason)
+{
+   if(StringFind(action, "REJECT_") == 0)
+      return action;
+   if(action == "ORDER_FAILED")
+      return "ORDER_FAILED";
+   if(reason == "")
+      return "";
+
+   int split = StringFind(reason, ";");
+   string key = (split >= 0 ? StringSubstr(reason, 0, split) : reason);
+   if(StringLen(key) > 90)
+      key = StringSubstr(key, 0, 90);
+   return key;
+}
+
+string DateKey(const datetime when)
+{
+   return TimeToString(when, TIME_DATE);
+}
+
+string DateToken(const string date)
+{
+   string token = date;
+   StringReplace(token, ".", "");
+   StringReplace(token, "-", "");
+   StringReplace(token, "/", "");
+   return token;
+}
+
+string UlongToString(const ulong value)
+{
+   return StringFormat("%I64u", value);
 }

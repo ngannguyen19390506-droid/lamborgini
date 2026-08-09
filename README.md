@@ -10,6 +10,7 @@ Prototype EA MQL5 cho XAUUSD, dùng M15 làm context, M5 làm setup và M2 làm 
 MQL5/Experts/LamborghiniEA.mq5  EA chính cho MetaTrader 5
 docs/master-spec-v1.md          Tóm tắt logic thiết kế từ spec
 docs/backtest-checklist.md      Checklist test và tối ưu
+docs/journal-analysis.md        Cách đọc MAE/MFE và candidate/reject theo ngày
 ```
 
 ## Cài vào MT5
@@ -105,10 +106,17 @@ EA ghi file CSV:
 
 ```text
 LamborghiniEA_journal.csv
+LamborghiniEA_daily_events.csv
+LamborghiniEA_daily_summary.csv
 ```
 
-File nằm trong thư mục MT5 common files khi `InpWriteJournal = true`. Journal ghi entry, reject reason, exit, score, SL/TP, lot, RR, spread, equity và drawdown.
-Journal cũng ghi `execution` và `order_price` để phân tích Market/Limit/Stop trong backtest.
+Các file nằm trong thư mục MT5 common files. Journal chính bật bằng `InpWriteJournal`; daily analytics bật bằng `InpWriteDailyAnalysis`. Journal ghi entry, reject reason, exit, score, SL/TP, lot, RR, spread, equity và drawdown.
+Journal cũng ghi `execution`, `order_price`, `mae_money` và `mfe_money` để phân tích Market/Limit/Stop, mức âm tối đa và mức lời nổi tối đa của lệnh đã đóng.
+
+Từ bản `1.03`, EA có thêm daily analytics khi `InpWriteDailyAnalysis = true`:
+
+- `LamborghiniEA_daily_events.csv`: từng candidate/reject/entry/exit theo ngày, có `score_bucket` và `reason_key`.
+- `LamborghiniEA_daily_summary.csv`: snapshot tổng hợp theo ngày, action group và strategy. Nếu có nhiều snapshot cùng ngày, dùng dòng mới nhất theo `snapshot_time`.
 
 ## Backtest gợi ý
 
